@@ -24,7 +24,7 @@ import random
 # ============================================================
 
 # Europeana API - Free tier, register at [https://pro.europeana.eu/page/get-api](https://pro.europeana.eu/page/get-api)
-EUROPEANA_API_KEY = os.getenv("EUROPEANA_API_KEY", "api2demo")
+EUROPEANA_API_KEY = os.getenv("EUROPEANA_API_KEY", "asishamp")
 EUROPEANA_BASE_URL = "[https://api.europeana.eu/record/v2/search.json](https://api.europeana.eu/record/v2/search.json)"
 
 # App configuration
