@@ -1,11 +1,3 @@
-# “””
-ArchaeoFinder Backend
-
-FastAPI server for archaeological find comparison.
-Connects to Europeana and other museum databases.
-
-Optimiert für DigitalOcean App Platform.
-“””
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
