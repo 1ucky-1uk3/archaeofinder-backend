@@ -1,5 +1,5 @@
 # ArchaeoFinder Backend - Phase 2 Extended
-# Mit CLIP, ChromaDB und zusaetzlichen Datenbanken
+# Mit CLIP, ChromaDB, Europeana, PAS, PAN und DDB
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +19,16 @@ try:
     from PIL import Image
     import chromadb
     import numpy as np
+    from huggingface_hub import login as hf_login
     CLIP_AVAILABLE = True
 except ImportError as e:
     CLIP_AVAILABLE = False
 
+# API Keys aus den Umgebungsvariablen laden
 EUROPEANA_API_KEY = os.getenv("EUROPEANA_API_KEY", "api2demo")
+DDB_API_KEY = os.getenv("DDB_API_KEY", "")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = set(["jpg", "jpeg", "png", "webp", "gif"])
 
@@ -39,6 +44,15 @@ def initialize_clip():
     global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection
     if not CLIP_AVAILABLE:
         return False
+        
+    # Hugging Face Login durchführen, falls Token vorhanden (verhindert Rate-Limits)
+    if HF_TOKEN:
+        try:
+            hf_login(token=HF_TOKEN)
+            print("Erfolgreich bei Hugging Face eingeloggt.")
+        except Exception as e:
+            print(f"Hugging Face Login fehlgeschlagen: {e}")
+
     try:
         clip_model, _, clip_preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
         clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
@@ -47,6 +61,7 @@ def initialize_clip():
         image_collection = chroma_client.get_or_create_collection(name="archaeo_images")
         return True
     except Exception as e:
+        print(f"CLIP Initialisierung fehlgeschlagen: {e}")
         return False
 
 
@@ -93,13 +108,6 @@ class UploadResponse(BaseModel):
     message: str
 
 
-class IndexResponse(BaseModel):
-    success: bool
-    indexed_count: int
-    total_in_db: int
-    message: str
-
-
 EPOCH_MAPPING = {
     "Steinzeit": ["neolithic", "stone age", "mesolithic", "paleolithic"],
     "Bronzezeit": ["bronze age"],
@@ -111,17 +119,17 @@ EPOCH_MAPPING = {
 }
 
 OBJECT_TYPE_MAPPING = {
-    "Fibeln": ["fibula", "brooch", "pin"],
-    "Muenzen": ["coin", "numismatic"],
-    "Keramik": ["ceramic", "pottery", "vessel", "amphora"],
-    "Waffen": ["weapon", "sword", "axe", "tool"],
-    "Schmuck": ["jewelry", "jewellery", "ring", "bracelet", "necklace"],
-    "Kultgegenstaende": ["cult", "ritual", "religious", "votive"],
-    "Alltagsgegenstaende": ["domestic", "household"]
+    "Fibeln": ["fibula", "brooch", "pin", "fibel"],
+    "Muenzen": ["coin", "numismatic", "münze", "muenze"],
+    "Keramik": ["ceramic", "pottery", "vessel", "amphora", "keramik"],
+    "Waffen": ["weapon", "sword", "axe", "tool", "waffe", "schwert"],
+    "Schmuck": ["jewelry", "jewellery", "ring", "bracelet", "necklace", "schmuck"],
+    "Kultgegenstaende": ["cult", "ritual", "religious", "votive", "kult"],
+    "Alltagsgegenstaende": ["domestic", "household", "alltag"]
 }
 
 REGION_MAPPING = {
-    "Mitteleuropa": ["germany", "austria", "switzerland"],
+    "Mitteleuropa": ["germany", "austria", "switzerland", "deutschland", "österreich", "schweiz"],
     "Nordeuropa": ["scandinavia", "denmark", "sweden", "norway"],
     "Suedeuropa": ["italy", "greece", "spain"],
     "Westeuropa": ["france", "britain", "england"],
@@ -133,7 +141,7 @@ REGION_MAPPING = {
 }
 
 
-app = FastAPI(title="ArchaeoFinder API", version="2.1.0", docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(title="ArchaeoFinder API", version="2.2.0", docs_url="/docs", redoc_url="/redoc")
 
 app.add_middleware(
     CORSMiddleware,
@@ -172,54 +180,6 @@ def build_europeana_query(keywords=None, epoch=None, object_type=None, region=No
             query_parts.append("(" + " OR ".join(region_terms) + ")")
     return " AND ".join(query_parts)
 
-
-def parse_europeana_result(item):
-    title = "Unbekanntes Objekt"
-    if "title" in item and item["title"]:
-        title_data = item["title"]
-        if isinstance(title_data, list):
-            title = title_data[0]
-        else:
-            title = title_data
-    description = None
-    if "dcDescription" in item and item["dcDescription"]:
-        desc_data = item["dcDescription"]
-        if isinstance(desc_data, list):
-            description = desc_data[0]
-        else:
-            description = desc_data
-        if description and len(description) > 300:
-            description = description[:297] + "..."
-    museum = None
-    if "dataProvider" in item and item["dataProvider"]:
-        dp_data = item["dataProvider"]
-        if isinstance(dp_data, list):
-            museum = dp_data[0]
-        else:
-            museum = dp_data
-    epoch = None
-    if "year" in item and item["year"]:
-        years = item["year"]
-        if isinstance(years, list) and years:
-            if len(years) > 1:
-                epoch = str(min(years)) + " - " + str(max(years))
-            else:
-                epoch = str(years[0])
-    image_url = None
-    if "edmPreview" in item and item["edmPreview"]:
-        previews = item["edmPreview"]
-        if isinstance(previews, list):
-            image_url = previews[0]
-        else:
-            image_url = previews
-    source_url = None
-    if "guid" in item:
-        source_url = item["guid"]
-    elif "id" in item:
-        source_url = "https://www.europeana.eu/item" + item["id"]
-    return MuseumObject(id=item.get("id", "unknown"), title=title, description=description, museum=museum, epoch=epoch, image_url=image_url, source_url=source_url, source="europeana")
-
-
 async def search_europeana(query, rows=20):
     url = "https://api.europeana.eu/record/v2/search.json"
     params = {"wskey": EUROPEANA_API_KEY, "query": query, "rows": rows, "profile": "rich", "media": "true", "qf": "TYPE:IMAGE"}
@@ -234,9 +194,21 @@ async def search_europeana(query, rows=20):
             results = []
             for item in items:
                 try:
-                    parsed = parse_europeana_result(item)
-                    if parsed.image_url:
-                        results.append(parsed)
+                    title_data = item.get("title", ["Unbekanntes Objekt"])
+                    title = title_data[0] if isinstance(title_data, list) else title_data
+                    
+                    previews = item.get("edmPreview", [])
+                    image_url = previews[0] if isinstance(previews, list) else previews
+                    
+                    if image_url:
+                        results.append(MuseumObject(
+                            id=item.get("id", "unknown"), 
+                            title=title, 
+                            museum=item.get("dataProvider", [None])[0] if isinstance(item.get("dataProvider"), list) else item.get("dataProvider"),
+                            image_url=image_url, 
+                            source_url=item.get("guid", f"https://www.europeana.eu/item{item.get('id', '')}"),
+                            source="europeana"
+                        ))
                 except Exception:
                     continue
             return total, results
@@ -245,25 +217,13 @@ async def search_europeana(query, rows=20):
 
 
 # =============================================================================
-# PORTABLE ANTIQUITIES SCHEME (UK) - finds.org.uk
+# PORTABLE ANTIQUITIES SCHEME (UK)
 # =============================================================================
 
 async def search_pas_uk(keywords=None, object_type=None, rows=20):
     base_url = "https://finds.org.uk/database/search/results/format/json"
     params = {"show": rows}
-    
-    if keywords:
-        params["q"] = keywords
-    if object_type and object_type != "Alle Objekttypen":
-        type_mapping = {
-            "Fibeln": "BROOCH",
-            "Muenzen": "COIN",
-            "Keramik": "VESSEL",
-            "Waffen": "WEAPON",
-            "Schmuck": "FINGER RING"
-        }
-        if object_type in type_mapping:
-            params["objectType"] = type_mapping[object_type]
+    if keywords: params["q"] = keywords
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -277,71 +237,32 @@ async def search_pas_uk(keywords=None, object_type=None, rows=20):
             
             for item in items:
                 try:
-                    title = item.get("objectType", "Unknown Object")
-                    if item.get("broadperiod"):
-                        title = title + " (" + item.get("broadperiod") + ")"
-                    
-                    description = item.get("description", None)
-                    if description and len(description) > 300:
-                        description = description[:297] + "..."
-                    
-                    image_url = None
-                    if item.get("filename"):
-                        image_url = "https://finds.org.uk/images/thumbnails/" + item.get("filename")
-                    
-                    source_url = "https://finds.org.uk/database/artefacts/record/id/" + str(item.get("id", ""))
-                    
-                    findspot = None
-                    if item.get("county"):
-                        findspot = item.get("county")
-                        if item.get("parish"):
-                            findspot = findspot + ", " + item.get("parish")
-                    
-                    results.append(MuseumObject(
-                        id="pas_" + str(item.get("id", "")),
-                        title=title,
-                        description=description,
-                        museum="Portable Antiquities Scheme (UK)",
-                        epoch=item.get("broadperiod", None),
-                        image_url=image_url,
-                        source_url=source_url,
-                        source="pas_uk",
-                        material=item.get("material", None),
-                        findspot=findspot
-                    ))
+                    image_url = f"https://finds.org.uk/images/thumbnails/{item.get('filename')}" if item.get("filename") else None
+                    if image_url:
+                        results.append(MuseumObject(
+                            id=f"pas_{item.get('id', '')}",
+                            title=item.get("objectType", "Unknown Object"),
+                            museum="Portable Antiquities Scheme (UK)",
+                            epoch=item.get("broadperiod", None),
+                            image_url=image_url,
+                            source_url=f"https://finds.org.uk/database/artefacts/record/id/{item.get('id', '')}",
+                            source="pas_uk"
+                        ))
                 except Exception:
                     continue
-            
             return total, results
     except Exception:
         return 0, []
 
 
 # =============================================================================
-# PORTABLE ANTIQUITIES NETHERLANDS - portable-antiquities.nl
+# PORTABLE ANTIQUITIES NETHERLANDS (PAN)
 # =============================================================================
 
-async def search_pan_nl(keywords=None, object_type=None, rows=20):
+async def search_pan_nl(keywords=None, rows=20):
     base_url = "https://portable-antiquities.nl/pan/api/search"
-    
     params = {"limit": rows, "offset": 0}
-    
-    search_terms = []
-    if keywords:
-        search_terms.append(keywords)
-    if object_type and object_type != "Alle Objekttypen":
-        type_mapping = {
-            "Fibeln": "fibula",
-            "Muenzen": "munt",
-            "Keramik": "aardewerk",
-            "Waffen": "wapen",
-            "Schmuck": "ring"
-        }
-        if object_type in type_mapping:
-            search_terms.append(type_mapping[object_type])
-    
-    if search_terms:
-        params["q"] = " ".join(search_terms)
+    if keywords: params["q"] = keywords
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -355,32 +276,77 @@ async def search_pan_nl(keywords=None, object_type=None, rows=20):
             
             for item in items:
                 try:
-                    title = item.get("objectName", item.get("name", "Unknown Object"))
-                    
-                    description = item.get("description", None)
-                    if description and len(description) > 300:
-                        description = description[:297] + "..."
-                    
                     image_url = item.get("imageUrl", item.get("thumbnail", None))
-                    
                     item_id = item.get("id", item.get("identifier", ""))
-                    source_url = "https://portable-antiquities.nl/pan/#/object/" + str(item_id)
-                    
-                    results.append(MuseumObject(
-                        id="pan_" + str(item_id),
-                        title=title,
-                        description=description,
-                        museum="Portable Antiquities Netherlands",
-                        epoch=item.get("period", item.get("dating", None)),
-                        image_url=image_url,
-                        source_url=source_url,
-                        source="pan_nl",
-                        material=item.get("material", None),
-                        findspot=item.get("municipality", item.get("findspot", None))
-                    ))
+                    if image_url:
+                        results.append(MuseumObject(
+                            id=f"pan_{item_id}",
+                            title=item.get("objectName", item.get("name", "Unknown Object")),
+                            museum="Portable Antiquities Netherlands",
+                            image_url=image_url,
+                            source_url=f"https://portable-antiquities.nl/pan/#/object/{item_id}",
+                            source="pan_nl"
+                        ))
                 except Exception:
                     continue
+            return total, results
+    except Exception:
+        return 0, []
+
+
+# =============================================================================
+# DEUTSCHE DIGITALE BIBLIOTHEK (DDB)
+# =============================================================================
+
+async def search_ddb(keywords=None, rows=20):
+    if not DDB_API_KEY:
+        return 0, []
+        
+    base_url = "https://api.deutsche-digitale-bibliothek.de/search"
+    query_parts = ["(Archäologie OR archaeology)"]
+    if keywords:
+        query_parts.append(f"({keywords})")
+        
+    params = {
+        "oauth_consumer_key": DDB_API_KEY,
+        "query": " AND ".join(query_parts),
+        "rows": rows
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            headers = {"Accept": "application/json"}
+            response = await client.get(base_url, params=params, headers=headers)
+            if response.status_code != 200:
+                return 0, []
             
+            data = response.json()
+            results = []
+            
+            # Die DDB API verpackt Ergebnisse oft in "results" -> "docs"
+            items_container = data.get("results", [])
+            docs = items_container[0].get("docs", []) if items_container else []
+            total = data.get("numberOfResults", len(docs))
+            
+            for item in docs:
+                try:
+                    item_id = item.get("id", "")
+                    title = item.get("title", "Unbekanntes Objekt")
+                    
+                    # DDB Thumbnails haben meist dieses feste Muster
+                    image_url = f"https://api.deutsche-digitale-bibliothek.de/binary/{item_id}/list/1.jpg" if item.get("thumbnail") else None
+                    
+                    if image_url:
+                        results.append(MuseumObject(
+                            id=f"ddb_{item_id}",
+                            title=title,
+                            museum=item.get("provider", "Deutsche Digitale Bibliothek"),
+                            image_url=image_url,
+                            source_url=f"https://www.deutsche-digitale-bibliothek.de/item/{item_id}",
+                            source="ddb"
+                        ))
+                except Exception:
+                    continue
             return total, results
     except Exception:
         return 0, []
@@ -395,25 +361,30 @@ async def search_all_sources(keywords=None, epoch=None, object_type=None, region
     sources_searched = []
     total = 0
     
-    # Calculate results per source
-    per_source = max(5, limit // 3)
-    
-    # Create search tasks
+    # Ergebnisse dynamisch aufteilen
+    active_sources = 3
+    if DDB_API_KEY and (not region or region in ["Alle Regionen", "Mitteleuropa"]):
+        active_sources += 1
+        
+    per_source = max(5, limit // active_sources)
     tasks = []
     
-    # Always search Europeana
+    # 1. Europeana
     europeana_query = build_europeana_query(keywords=keywords, epoch=epoch, object_type=object_type, region=region)
     tasks.append(("europeana", search_europeana(europeana_query, rows=per_source)))
     
-    # Search PAS UK if region matches or no region specified
+    # 2. PAS UK
     if not region or region in ["Alle Regionen", "Grossbritannien", "Westeuropa"]:
         tasks.append(("pas_uk", search_pas_uk(keywords=keywords, object_type=object_type, rows=per_source)))
     
-    # Search PAN Netherlands if region matches or no region specified
+    # 3. PAN Netherlands
     if not region or region in ["Alle Regionen", "Niederlande", "Westeuropa"]:
-        tasks.append(("pan_nl", search_pan_nl(keywords=keywords, object_type=object_type, rows=per_source)))
+        tasks.append(("pan_nl", search_pan_nl(keywords=keywords, rows=per_source)))
+        
+    # 4. DDB (Deutschland)
+    if DDB_API_KEY and (not region or region in ["Alle Regionen", "Mitteleuropa"]):
+        tasks.append(("ddb", search_ddb(keywords=keywords, rows=per_source)))
     
-    # Execute all searches concurrently
     for source_name, task in tasks:
         try:
             source_total, source_results = await task
@@ -432,34 +403,29 @@ async def search_all_sources(keywords=None, epoch=None, object_type=None, region
 # =============================================================================
 
 async def search_by_image(image, limit=20):
-    if not image_collection:
-        return []
-    count = image_collection.count()
-    if count == 0:
-        return []
+    if not image_collection: return []
+    if image_collection.count() == 0: return []
     embedding = get_image_embedding(image)
-    if not embedding:
-        return []
-    n_results = min(limit, count)
-    results = image_collection.query(query_embeddings=[embedding], n_results=n_results)
-    if not results:
-        return []
-    ids_list = results.get("ids", [])
-    if not ids_list or not ids_list[0]:
-        return []
+    if not embedding: return []
+    
+    results = image_collection.query(query_embeddings=[embedding], n_results=min(limit, image_collection.count()))
+    if not results or not results.get("ids") or not results["ids"][0]: return []
+    
     museum_objects = []
-    metadatas = results.get("metadatas", [[]])
-    distances = results.get("distances", [[]])
-    for i in range(len(ids_list[0])):
-        item_id = ids_list[0][i]
-        metadata = {}
-        if metadatas and metadatas[0] and i < len(metadatas[0]):
-            metadata = metadatas[0][i]
-        distance = 1.0
-        if distances and distances[0] and i < len(distances[0]):
-            distance = distances[0][i]
+    for i, item_id in enumerate(results["ids"][0]):
+        metadata = results["metadatas"][0][i] if "metadatas" in results and results["metadatas"][0] else {}
+        distance = results["distances"][0][i] if "distances" in results and results["distances"][0] else 1.0
         similarity = int(max(0, min(100, (1 - distance) * 100)))
-        museum_objects.append(MuseumObject(id=item_id, title=metadata.get("title", "Unbekannt"), museum=metadata.get("museum", None), image_url=metadata.get("image_url", None), source_url=metadata.get("source_url", None), source=metadata.get("source", "europeana"), similarity=similarity))
+        
+        museum_objects.append(MuseumObject(
+            id=item_id, 
+            title=metadata.get("title", "Unbekannt"), 
+            museum=metadata.get("museum", None), 
+            image_url=metadata.get("image_url", None), 
+            source_url=metadata.get("source_url", None), 
+            source=metadata.get("source", "europeana"), 
+            similarity=similarity
+        ))
     return museum_objects
 
 
@@ -469,103 +435,58 @@ async def search_by_image(image, limit=20):
 
 @app.get("/")
 async def root():
-    db_count = 0
-    if image_collection:
-        db_count = image_collection.count()
     return {
         "name": "ArchaeoFinder API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "status": "online",
         "clip_available": CLIP_AVAILABLE,
-        "images_indexed": db_count,
-        "sources": ["europeana", "pas_uk", "pan_nl"]
+        "images_indexed": image_collection.count() if image_collection else 0,
+        "sources": ["europeana", "pas_uk", "pan_nl"] + (["ddb"] if DDB_API_KEY else [])
     }
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "clip": CLIP_AVAILABLE}
-
 
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_image_endpoint(file: UploadFile = File(...)):
-    filename = file.filename or "unknown"
-    ext = ""
-    if "." in filename:
-        ext = filename.rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Ungueltiges Format")
     content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="Datei zu gross")
-    image_hash = hashlib.sha256(content).hexdigest()[:16]
-    image_id = "img_" + image_hash + "_" + datetime.now().strftime("%Y%m%d%H%M%S")
-    uploaded_images[image_id] = {"content": content, "filename": filename, "content_type": file.content_type, "uploaded_at": datetime.now().isoformat()}
+    if len(content) > MAX_FILE_SIZE: raise HTTPException(status_code=400, detail="Datei zu gross")
+    
+    image_id = f"img_{hashlib.sha256(content).hexdigest()[:16]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    uploaded_images[image_id] = {"content": content, "filename": file.filename, "content_type": file.content_type}
     return UploadResponse(success=True, image_id=image_id, message="Bild hochgeladen")
-
 
 @app.get("/api/search", response_model=SearchResponse)
 async def search(q: Optional[str] = Query(None), image_id: Optional[str] = Query(None), epoch: Optional[str] = Query(None), object_type: Optional[str] = Query(None), region: Optional[str] = Query(None), limit: int = Query(20, ge=1, le=50)):
-    search_mode = "text"
-    results = []
-    total = 0
-    sources_searched = []
+    search_mode, results, total, sources_searched = "text", [], 0, []
     
     if image_id and image_id in uploaded_images and CLIP_AVAILABLE:
         try:
-            content = uploaded_images[image_id]["content"]
-            image = Image.open(io.BytesIO(content)).convert("RGB")
+            image = Image.open(io.BytesIO(uploaded_images[image_id]["content"])).convert("RGB")
             results = await search_by_image(image, limit)
-            total = len(results)
-            search_mode = "image"
-            sources_searched = ["clip_index"]
-        except Exception:
-            pass
+            total, search_mode, sources_searched = len(results), "image", ["clip_index"]
+        except Exception: pass
     
     if not results or q:
-        total, text_results, sources_searched = await search_all_sources(
-            keywords=q, epoch=epoch, object_type=object_type, region=region, limit=limit
-        )
+        total, text_results, sources_searched = await search_all_sources(keywords=q, epoch=epoch, object_type=object_type, region=region, limit=limit)
         
         if search_mode == "text":
             import random
-            for i in range(len(text_results)):
-                result = text_results[i]
-                base_similarity = 95 - (i * 2)
-                result.similarity = max(50, min(99, base_similarity + random.randint(-5, 5)))
+            for i, r in enumerate(text_results):
+                r.similarity = max(50, min(99, (95 - (i * 2)) + random.randint(-5, 5)))
             results = text_results
         else:
             search_mode = "hybrid"
-            existing_ids = set()
-            for r in results:
-                existing_ids.add(r.id)
+            existing_ids = {r.id for r in results}
             for r in text_results:
                 if r.id not in existing_ids:
                     r.similarity = 50
                     results.append(r)
     
     results.sort(key=lambda x: x.similarity or 0, reverse=True)
-    search_id = "search_" + datetime.now().strftime("%Y%m%d%H%M%S")
-    
     return SearchResponse(
-        success=True,
-        total_results=total,
-        results=results[:limit],
-        search_id=search_id,
+        success=True, total_results=total, results=results[:limit],
+        search_id=f"search_{datetime.now().strftime('%Y%m%d%H%M%S')}",
         filters_applied={"keywords": q, "epoch": epoch, "object_type": object_type, "region": region},
-        search_mode=search_mode,
-        sources_searched=sources_searched
+        search_mode=search_mode, sources_searched=sources_searched
     )
-
-
-@app.get("/api/filters")
-async def get_filters():
-    return {
-        "epochs": ["Alle Epochen"] + list(EPOCH_MAPPING.keys()),
-        "object_types": ["Alle Objekttypen"] + list(OBJECT_TYPE_MAPPING.keys()),
-        "regions": ["Alle Regionen"] + list(REGION_MAPPING.keys())
-    }
-
 
 @app.get("/api/sources")
 async def get_sources():
@@ -574,15 +495,11 @@ async def get_sources():
             {"id": "europeana", "name": "Europeana", "country": "EU", "status": "active", "url": "https://www.europeana.eu"},
             {"id": "pas_uk", "name": "Portable Antiquities Scheme", "country": "UK", "status": "active", "url": "https://finds.org.uk"},
             {"id": "pan_nl", "name": "Portable Antiquities Netherlands", "country": "NL", "status": "active", "url": "https://portable-antiquities.nl"},
-            {"id": "ddb", "name": "Deutsche Digitale Bibliothek", "country": "DE", "status": "coming_soon", "url": "https://www.deutsche-digitale-bibliothek.de"},
-            {"id": "danish", "name": "Metaldetektorfund Danmark", "country": "DK", "status": "coming_soon", "url": "https://www.metaldetektorfund.dk"},
-            {"id": "czech", "name": "AMCR Digiarchiv", "country": "CZ", "status": "coming_soon", "url": "https://digiarchiv.aiscr.cz"},
-            {"id": "scotland", "name": "Treasure Trove Scotland", "country": "UK", "status": "coming_soon", "url": "https://treasuretrovescotland.co.uk"}
+            {"id": "ddb", "name": "Deutsche Digitale Bibliothek", "country": "DE", "status": "active" if DDB_API_KEY else "needs_api_key", "url": "https://www.deutsche-digitale-bibliothek.de"},
+            {"id": "danish", "name": "Metaldetektorfund Danmark", "country": "DK", "status": "coming_soon", "url": "https://www.metaldetektorfund.dk"}
         ]
     }
 
-
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
