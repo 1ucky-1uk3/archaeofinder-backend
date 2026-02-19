@@ -9,7 +9,6 @@ from PIL import Image
 import hashlib
 import json
 import asyncio
-import sys
 
 # CLIP imports
 CLIP_AVAILABLE = False
@@ -75,7 +74,6 @@ async def initialize_clip_async():
         loop = asyncio.get_event_loop()
         
         def load_clip():
-            global clip_model, clip_preprocess, clip_tokenizer
             print("Loading CLIP model...", flush=True)
             model, _, preprocess = open_clip.create_model_and_transforms(
                 "ViT-B-32", 
@@ -172,7 +170,10 @@ async def root():
             "image_search": "/api/image-search",
             "text_search": "/api/text-search",
             "index_image": "/api/index-image",
-            "collection_stats": "/api/collection-stats"
+            "collection_stats": "/api/collection-stats",
+            "list_images": "/api/list-images",
+            "delete_image": "/api/delete-image/{image_id}",
+            "clear_collection": "/api/clear-collection"
         }
     }
 
@@ -476,7 +477,7 @@ async def list_images(limit: int = 100, offset: int = 0):
     if not CLIP_AVAILABLE or image_collection is None:
         raise HTTPException(
             status_code=503, 
-            detail="CLIP not available or not initialized"i
+            detail="CLIP not available or not initialized"
         )
     
     try:
