@@ -9,6 +9,10 @@ from PIL import Image
 import hashlib
 import json
 import asyncio
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
 # CLIP imports
 CLIP_AVAILABLE = False
@@ -74,13 +78,15 @@ async def initialize_clip_async():
         loop = asyncio.get_event_loop()
         
         def load_clip():
-            print("Loading CLIP model...", flush=True)
+            print("Loading CLIP model from cache...", flush=True)
+            # Model should already be downloaded in Docker image
             model, _, preprocess = open_clip.create_model_and_transforms(
                 "ViT-B-32", 
                 pretrained="laion2b_s34b_b79k"
             )
             tokenizer = open_clip.get_tokenizer("ViT-B-32")
             model.eval()
+            print("✓ CLIP model loaded", flush=True)
             return model, preprocess, tokenizer
         
         clip_model, clip_preprocess, clip_tokenizer = await loop.run_in_executor(
@@ -97,6 +103,7 @@ async def initialize_clip_async():
         print(f"✓ ChromaDB initialized. Collection has {image_collection.count()} images", flush=True)
         
         initialization_complete = True
+        print("✓ Full initialization complete", flush=True)
         return True
         
     except Exception as e:
@@ -127,6 +134,7 @@ async def startup_event():
 # Health check endpoint - MUST respond quickly
 @app.get("/health")
 async def health_check():
+    """Simple health check that always returns 200 if server is running"""
     collection_count = 0
     if image_collection is not None:
         try:
@@ -143,9 +151,16 @@ async def health_check():
         "error": initialization_error
     }
 
+# Liveness probe
+@app.get("/healthz")
+async def liveness():
+    """Kubernetes-style liveness probe"""
+    return {"status": "alive"}
+
 # Readiness check
 @app.get("/ready")
 async def readiness_check():
+    """Check if app is ready to serve requests"""
     if not initialization_complete:
         raise HTTPException(status_code=503, detail="Still initializing")
     
@@ -165,6 +180,7 @@ async def root():
         "clip_enabled": CLIP_AVAILABLE and clip_model is not None,
         "endpoints": {
             "health": "/health",
+            "healthz": "/healthz",
             "ready": "/ready",
             "search_europeana": "/api/search",
             "image_search": "/api/image-search",
@@ -363,7 +379,7 @@ async def text_search(search_query: TextSearchQuery):
     if image_collection.count() == 0:
         raise HTTPException(
             status_code=404,
-            detail="No images indexed yet. Please index images first using /api/index-image"
+            detail="No images indexed yet. Please index imagesfirst using /api/index-image"
         )
     
     try:
