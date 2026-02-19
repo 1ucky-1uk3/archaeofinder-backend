@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     libjpeg-dev \
     zlib1g-dev \
     libpng-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Pip aktualisieren
@@ -29,10 +30,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 # Verzeichnis für ChromaDB erstellen
-RUN mkdir -p /app/chroma_data
+RUN mkdir -p /app/chroma_data && chmod 777 /app/chroma_data
 
 # Port freigeben
 EXPOSE 8080
 
-# Anwendung starten
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Längerer Timeout für Startup
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "120"]
