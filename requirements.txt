@@ -9,3 +9,4 @@ torchvision==0.17.0
 open-clip-torch==2.23.0
 chromadb==0.4.22
 numpy<2.0.0
+huggingface-hub>=0.20.0
