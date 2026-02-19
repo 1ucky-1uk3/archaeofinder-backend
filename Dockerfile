@@ -11,7 +11,6 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     libpng-dev \
     curl \
-    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Pip aktualisieren
@@ -27,9 +26,6 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# CLIP Modell vorab herunterladen
-RUN python -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k'); print('CLIP model downloaded')"
-
 # Anwendung kopieren
 COPY main.py .
 
@@ -39,9 +35,5 @@ RUN mkdir -p /app/chroma_data && chmod 777 /app/chroma_data
 # Port freigeben
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD curl -f http://localhost:8080/health || exit 1
-
 # Anwendung starten
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "120"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "120", "--workers", "1"]
