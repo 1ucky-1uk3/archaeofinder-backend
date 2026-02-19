@@ -73,12 +73,13 @@ def initialize_clip():
         print("✓ CLIP-Modell geladen")
         
         # ChromaDB initialisieren (persistent storage)
+                # ChromaDB initialisieren (persistent storage)
         print("Initialisiere ChromaDB...")
         chroma_client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
             persist_directory="/app/chroma_data",
             anonymized_telemetry=False
         ))
+
         
         # Collection für Bilder erstellen oder laden
         image_collection = chroma_client.get_or_create_collection(
