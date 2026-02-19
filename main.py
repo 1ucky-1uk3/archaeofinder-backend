@@ -1,24 +1,25 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 import httpx
 import os
 from io import BytesIO
 from PIL import Image
-import base64
+import hashlib
+import json
 
 # CLIP imports
 try:
     import torch
     import open_clip
     import chromadb
-    import numpy as np
     CLIP_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"CLIP Import Error: {e}")
     CLIP_AVAILABLE = False
 
-app = FastAPI(title="ArchaeoFinder API")
+app = FastAPI(title="ArchaeoFinder API", version="1.0.0")
 
 # CORS Middleware
 app.add_middleware(
@@ -46,49 +47,71 @@ class SearchQuery(BaseModel):
     rows: int = 12
     start: int = 1
 
-class ImageIndexRequest(BaseModel):
-    image_url: str
-    metadata: Optional[dict] = None
+class TextSearchQuery(BaseModel):
+    query: str
+    top_k: int = 10
 
 # Initialize CLIP
 def initialize_clip():
     global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection
+    
     if not CLIP_AVAILABLE:
+        print("CLIP libraries not available")
         return False
+    
     try:
+        print("Initializing CLIP model...")
         clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-            "ViT-B-32", pretrained="laion2b_s34b_b79k"
+            "ViT-B-32", 
+            pretrained="laion2b_s34b_b79k"
         )
         clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
         clip_model.eval()
+        print("CLIP model loaded successfully")
         
-        # PersistentClient für dauerhafte Speicherung
+        print("Initializing ChromaDB...")
         chroma_client = chromadb.PersistentClient(path="/app/chroma_data")
-        image_collection = chroma_client.get_or_create_collection(name="archaeo_images")
+        image_collection = chroma_client.get_or_create_collection(
+            name="archaeo_images",
+            metadata={"hnsw:space": "cosine"}
+        )
+        print(f"ChromaDB initialized. Collection has {image_collection.count()} images")
+        
         return True
     except Exception as e:
         print(f"CLIP initialization error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
+    print("Starting ArchaeoFinder API...")
     if CLIP_AVAILABLE:
         success = initialize_clip()
         if success:
-            print("CLIP initialized successfully")
+            print("✓ CLIP initialized successfully")
         else:
-            print("CLIP initialization failed")
+            print("✗ CLIP initialization failed")
     else:
-        print("CLIP not available - image search disabled")
+        print("✗ CLIP not available - image search disabled")
 
 # Health check endpoint
 @app.get("/health")
 async def health_check():
+    collection_count = 0
+    if image_collection is not None:
+        try:
+            collection_count = image_collection.count()
+        except:
+            pass
+    
     return {
         "status": "healthy",
         "clip_available": CLIP_AVAILABLE,
-        "clip_initialized": clip_model is not None
+        "clip_initialized": clip_model is not None,
+        "indexed_images": collection_count
     }
 
 # Root endpoint
@@ -97,11 +120,15 @@ async def root():
     return {
         "message": "ArchaeoFinder API",
         "version": "1.0.0",
+        "status": "running",
+        "clip_enabled": CLIP_AVAILABLE and clip_model is not None,
         "endpoints": {
-            "search": "/api/search",
+            "health": "/health",
+            "search_europeana": "/api/search",
             "image_search": "/api/image-search",
+            "text_search": "/api/text-search",
             "index_image": "/api/index-image",
-            "health": "/health"
+            "collection_stats": "/api/collection-stats"
         }
     }
 
@@ -109,7 +136,10 @@ async def root():
 @app.post("/api/search")
 async def search_europeana(search_query: SearchQuery):
     if not EUROPEANA_API_KEY:
-        raise HTTPException(status_code=500, detail="Europeana API key not configured")
+        raise HTTPException(
+            status_code=500, 
+            detail="Europeana API key not configured. Set EUROPEANA_API_KEY environment variable."
+        )
     
     params = {
         "wskey": EUROPEANA_API_KEY,
@@ -126,19 +156,39 @@ async def search_europeana(search_query: SearchQuery):
             response = await client.get(EUROPEANA_SEARCH_URL, params=params)
             response.raise_for_status()
             return response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Europeana API timeout")
     except httpx.HTTPError as e:
         raise HTTPException(status_code=500, detail=f"Europeana API error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 # Image search endpoint
 @app.post("/api/image-search")
-async def image_search(file: UploadFile = File(...), top_k: int = 10):
+async def image_search(file: UploadFile = File(...), top_k: int = Form(10)):
     if not CLIP_AVAILABLE or clip_model is None:
-        raise HTTPException(status_code=503, detail="CLIP not available")
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized. Image search is disabled."
+        )
+    
+    if image_collection.count() == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="No images indexed yet. Please index images first using /api/index-image"
+        )
     
     try:
-        # Read and process image
+        # Read and validate image
         image_data = await file.read()
-        image = Image.open(BytesIO(image_data)).convert("RGB")
+        
+        if len(image_data) == 0:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        try:
+            image = Image.open(BytesIO(image_data)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
         
         # Generate embedding
         with torch.no_grad():
@@ -148,28 +198,48 @@ async def image_search(file: UploadFile = File(...), top_k: int = 10):
             embedding = image_features.cpu().numpy().flatten().tolist()
         
         # Search in ChromaDB
+        n_results = min(top_k, image_collection.count())
         results = image_collection.query(
             query_embeddings=[embedding],
-            n_results=min(top_k, image_collection.count())
+            n_results=n_results
         )
         
         return {
+            "success": True,
             "results": results,
-            "count": len(results["ids"][0]) if results["ids"] else 0
+            "count": len(results["ids"][0]) if results["ids"] else 0,
+            "total_indexed": image_collection.count()
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Image search error: {str(e)}")
 
 # Index image endpoint
 @app.post("/api/index-image")
-async def index_image(file: UploadFile = File(...), metadata: Optional[str] = None):
+async def index_image(
+    file: UploadFile = File(...), 
+    metadata: Optional[str] = Form(None)
+):
     if not CLIP_AVAILABLE or clip_model is None:
-        raise HTTPException(status_code=503, detail="CLIP not available")
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized"
+        )
     
     try:
-        # Read and process image
+        # Read and validate image
         image_data = await file.read()
-        image = Image.open(BytesIO(image_data)).convert("RGB")
+        
+        if len(image_data) == 0:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        try:
+            image = Image.open(BytesIO(image_data)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
         
         # Generate embedding
         with torch.no_grad():
@@ -179,62 +249,131 @@ async def index_image(file: UploadFile = File(...), metadata: Optional[str] = No
             embedding = image_features.cpu().numpy().flatten().tolist()
         
         # Generate unique ID
-        import hashlib
         image_id = hashlib.md5(image_data).hexdigest()
+        
+        # Parse metadata if provided
+        meta_dict = {}
+        if metadata:
+            try:
+                meta_dict = json.loads(metadata)
+            except:
+                meta_dict = {"raw_metadata": metadata}
+        
+        meta_dict["filename"] = file.filename
+        meta_dict["content_type"] = file.content_type or "image/unknown"
+        
+        # Check if image already exists
+        try:
+            existing = image_collection.get(ids=[image_id])
+            if existing and existing["ids"]:
+                return {
+                    "success": True,
+                    "image_id": image_id,
+                    "message": "Image already indexed",
+                    "already_exists": True,
+                    "total_indexed": image_collection.count()
+                }
+        except:
+            pass
         
         # Store in ChromaDB
         image_collection.add(
             embeddings=[embedding],
             ids=[image_id],
-            metadatas=[{"filename": file.filename, "metadata": metadata or ""}]
+            metadatas=[meta_dict]
         )
         
         return {
             "success": True,
             "image_id": image_id,
-            "message": "Image indexed successfully"
+            "message": "Image indexed successfully",
+            "already_exists": False,
+            "total_indexed": image_collection.count()
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Image indexing error: {str(e)}")
 
 # Text search endpoint
 @app.post("/api/text-search")
-async def text_search(query: str, top_k: int = 10):
+async def text_search(search_query: TextSearchQuery):
     if not CLIP_AVAILABLE or clip_model is None:
-        raise HTTPException(status_code=503, detail="CLIP not available")
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized"
+        )
+    
+    if image_collection.count() == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="No images indexed yet. Please index images first using /api/index-image"
+        )
     
     try:
         # Generate text embedding
         with torch.no_grad():
-            text_tokens = clip_tokenizer([query])
+            text_tokens = clip_tokenizer([search_query.query])
             text_features = clip_model.encode_text(text_tokens)
             text_features /= text_features.norm(dim=-1, keepdim=True)
             embedding = text_features.cpu().numpy().flatten().tolist()
         
         # Search in ChromaDB
+        n_results = min(search_query.top_k, image_collection.count())
         results = image_collection.query(
             query_embeddings=[embedding],
-            n_results=min(top_k, image_collection.count())
+            n_results=n_results
         )
         
         return {
+            "success": True,
+            "query": search_query.query,
             "results": results,
-            "count": len(results["ids"][0]) if results["ids"] else 0
+            "count": len(results["ids"][0]) if results["ids"] else 0,
+            "total_indexed": image_collection.count()
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Text search error: {str(e)}")
 
 # Collection stats endpoint
 @app.get("/api/collection-stats")
 async def collection_stats():
     if not CLIP_AVAILABLE or image_collection is None:
-        raise HTTPException(status_code=503, detail="CLIP not available")
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized"
+        )
     
     try:
         count = image_collection.count()
         return {
+            "success": True,
             "total_images": count,
-            "collection_name": image_collection.name
+            "collection_name": image_collection.name,
+            "collection_metadata": image_collection.metadata
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stats error: {str(e)}")
+
+# Delete image endpoint
+@app.delete("/api/delete-image/{image_id}")
+async def delete_image(image_id: str):
+    if not CLIP_AVAILABLE or image_collection is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized"
+        )
+    
+    try:
+        image_collection.delete(ids=[image_id])
+        return {
+            "success": True,
+            "message": f"Image {image_id} deleted successfully",
+            "total_indexed": image_collection.count()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
