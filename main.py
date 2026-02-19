@@ -8,15 +8,25 @@ from io import BytesIO
 from PIL import Image
 import hashlib
 import json
+import asyncio
+import sys
 
 # CLIP imports
+CLIP_AVAILABLE = False
+clip_model = None
+clip_preprocess = None
+clip_tokenizer = None
+chroma_client = None
+image_collection = None
+
 try:
     import torch
     import open_clip
     import chromadb
     CLIP_AVAILABLE = True
+    print("✓ CLIP libraries imported successfully", flush=True)
 except ImportError as e:
-    print(f"CLIP Import Error: {e}")
+    print(f"✗ CLIP Import Error: {e}", flush=True)
     CLIP_AVAILABLE = False
 
 app = FastAPI(title="ArchaeoFinder API", version="1.0.0")
@@ -34,12 +44,9 @@ app.add_middleware(
 EUROPEANA_API_KEY = os.getenv("EUROPEANA_API_KEY", "")
 EUROPEANA_SEARCH_URL = "https://api.europeana.eu/record/v2/search.json"
 
-# CLIP globals
-clip_model = None
-clip_preprocess = None
-clip_tokenizer = None
-chroma_client = None
-image_collection = None
+# Initialization flag
+initialization_complete = False
+initialization_error = None
 
 # Models
 class SearchQuery(BaseModel):
@@ -51,53 +58,75 @@ class TextSearchQuery(BaseModel):
     query: str
     top_k: int = 10
 
-# Initialize CLIP
-def initialize_clip():
+# Initialize CLIP in background
+async def initialize_clip_async():
     global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection
+    global initialization_complete, initialization_error
     
     if not CLIP_AVAILABLE:
-        print("CLIP libraries not available")
+        print("✗ CLIP libraries not available", flush=True)
+        initialization_complete = True
         return False
     
     try:
-        print("Initializing CLIP model...")
-        clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-            "ViT-B-32", 
-            pretrained="laion2b_s34b_b79k"
-        )
-        clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
-        clip_model.eval()
-        print("CLIP model loaded successfully")
+        print("Starting CLIP initialization...", flush=True)
         
-        print("Initializing ChromaDB...")
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def load_clip():
+            global clip_model, clip_preprocess, clip_tokenizer
+            print("Loading CLIP model...", flush=True)
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                "ViT-B-32", 
+                pretrained="laion2b_s34b_b79k"
+            )
+            tokenizer = open_clip.get_tokenizer("ViT-B-32")
+            model.eval()
+            return model, preprocess, tokenizer
+        
+        clip_model, clip_preprocess, clip_tokenizer = await loop.run_in_executor(
+            None, load_clip
+        )
+        print("✓ CLIP model loaded successfully", flush=True)
+        
+        print("Initializing ChromaDB...", flush=True)
         chroma_client = chromadb.PersistentClient(path="/app/chroma_data")
         image_collection = chroma_client.get_or_create_collection(
             name="archaeo_images",
             metadata={"hnsw:space": "cosine"}
         )
-        print(f"ChromaDB initialized. Collection has {image_collection.count()} images")
+        print(f"✓ ChromaDB initialized. Collection has {image_collection.count()} images", flush=True)
         
+        initialization_complete = True
         return True
+        
     except Exception as e:
-        print(f"CLIP initialization error: {e}")
+        error_msg = f"CLIP initialization error: {e}"
+        print(f"✗ {error_msg}", flush=True)
         import traceback
         traceback.print_exc()
+        initialization_error = error_msg
+        initialization_complete = True
         return False
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    print("Starting ArchaeoFinder API...")
+    print("=" * 60, flush=True)
+    print("Starting ArchaeoFinder API...", flush=True)
+    print("=" * 60, flush=True)
+    
+    # Start CLIP initialization in background
     if CLIP_AVAILABLE:
-        success = initialize_clip()
-        if success:
-            print("✓ CLIP initialized successfully")
-        else:
-            print("✗ CLIP initialization failed")
+        asyncio.create_task(initialize_clip_async())
     else:
-        print("✗ CLIP not available - image search disabled")
+        global initialization_complete
+        initialization_complete = True
+    
+    print("✓ API server started (CLIP loading in background)", flush=True)
 
-# Health check endpoint
+# Health check endpoint - MUST respond quickly
 @app.get("/health")
 async def health_check():
     collection_count = 0
@@ -109,9 +138,22 @@ async def health_check():
     
     return {
         "status": "healthy",
+        "initialization_complete": initialization_complete,
         "clip_available": CLIP_AVAILABLE,
         "clip_initialized": clip_model is not None,
-        "indexed_images": collection_count
+        "indexed_images": collection_count,
+        "error": initialization_error
+    }
+
+# Readiness check
+@app.get("/ready")
+async def readiness_check():
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="Still initializing")
+    
+    return {
+        "status": "ready",
+        "clip_initialized": clip_model is not None
     }
 
 # Root endpoint
@@ -121,9 +163,11 @@ async def root():
         "message": "ArchaeoFinder API",
         "version": "1.0.0",
         "status": "running",
+        "initialization_complete": initialization_complete,
         "clip_enabled": CLIP_AVAILABLE and clip_model is not None,
         "endpoints": {
             "health": "/health",
+            "ready": "/ready",
             "search_europeana": "/api/search",
             "image_search": "/api/image-search",
             "text_search": "/api/text-search",
@@ -166,6 +210,9 @@ async def search_europeana(search_query: SearchQuery):
 # Image search endpoint
 @app.post("/api/image-search")
 async def image_search(file: UploadFile = File(...), top_k: int = Form(10)):
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
     if not CLIP_AVAILABLE or clip_model is None:
         raise HTTPException(
             status_code=503, 
@@ -223,6 +270,9 @@ async def index_image(
     file: UploadFile = File(...), 
     metadata: Optional[str] = Form(None)
 ):
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
     if not CLIP_AVAILABLE or clip_model is None:
         raise HTTPException(
             status_code=503, 
@@ -300,6 +350,9 @@ async def index_image(
 # Text search endpoint
 @app.post("/api/text-search")
 async def text_search(search_query: TextSearchQuery):
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
     if not CLIP_AVAILABLE or clip_model is None:
         raise HTTPException(
             status_code=503, 
@@ -342,6 +395,9 @@ async def text_search(search_query: TextSearchQuery):
 # Collection stats endpoint
 @app.get("/api/collection-stats")
 async def collection_stats():
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
     if not CLIP_AVAILABLE or image_collection is None:
         raise HTTPException(
             status_code=503, 
@@ -362,6 +418,9 @@ async def collection_stats():
 # Delete image endpoint
 @app.delete("/api/delete-image/{image_id}")
 async def delete_image(image_id: str):
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
     if not CLIP_AVAILABLE or image_collection is None:
         raise HTTPException(
             status_code=503, 
@@ -377,3 +436,63 @@ async def delete_image(image_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
+
+# Clear collection endpoint
+@app.delete("/api/clear-collection")
+async def clear_collection():
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
+    if not CLIP_AVAILABLE or image_collection is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized"
+        )
+    
+    try:
+        # Get all IDs and delete them
+        all_items = image_collection.get()
+        if all_items and all_items["ids"]:
+            image_collection.delete(ids=all_items["ids"])
+            deleted_count = len(all_items["ids"])
+        else:
+            deleted_count = 0
+        
+        return {
+            "success": True,
+            "message": "Collection cleared successfully",
+            "deleted_count": deleted_count,
+            "total_indexed": image_collection.count()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clear collection error: {str(e)}")
+
+# Get all indexed images endpoint
+@app.get("/api/list-images")
+async def list_images(limit: int = 100, offset: int = 0):
+    if not initialization_complete:
+        raise HTTPException(status_code=503, detail="System still initializing, please wait")
+    
+    if not CLIP_AVAILABLE or image_collection is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="CLIP not available or not initialized"i
+        )
+    
+    try:
+        all_items = image_collection.get(
+            limit=limit,
+            offset=offset,
+            include=["metadatas"]
+        )
+        
+        return {
+            "success": True,
+            "images": all_items,
+            "count": len(all_items["ids"]) if all_items["ids"] else 0,
+            "total_indexed": image_collection.count(),
+            "limit": limit,
+            "offset": offset
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"List images error: {str(e)}")
