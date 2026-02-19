@@ -25,6 +25,11 @@ COPY main.py .
 
 RUN mkdir -p /app/chroma_data
 
+# Umgebungsvariablen vorbereiten (können beim Container-Start überschrieben werden)
+ENV HF_TOKEN=""
+ENV EUROPEANA_API_KEY="api2demo"
+ENV DDB_API_KEY=""
+
 EXPOSE 8080
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
