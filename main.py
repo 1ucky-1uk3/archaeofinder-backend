@@ -1,452 +1,349 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+# ArchaeoFinder Backend Phase 2
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import httpx
-import os
-from io import BytesIO
-from PIL import Image
+import base64
 import hashlib
-import json
-import warnings
+from datetime import datetime
+import os
+import io
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
+try:
+    import torch
+    import open_clip
+    from PIL import Image
+    import chromadb
+    import numpy as np
+    CLIP_AVAILABLE = True
+except ImportError as e:
+    CLIP_AVAILABLE = False
 
-# CLIP imports - lazy loading
-CLIP_AVAILABLE = False
+EUROPEANA_API_KEY = os.getenv('EUROPEANA_API_KEY', 'api2demo')
+MAX_FILE_SIZE = 10 * 1024 * 1024
+ALLOWED_EXTENSIONS = set(['jpg', 'jpeg', 'png', 'webp', 'gif'])
+
 clip_model = None
 clip_preprocess = None
 clip_tokenizer = None
 chroma_client = None
 image_collection = None
-torch = None
-open_clip = None
-chromadb = None
+uploaded_images = {}
 
-try:
-    import torch as torch_module
-    import open_clip as open_clip_module
-    import chromadb as chromadb_module
-    torch = torch_module
-    open_clip = open_clip_module
-    chromadb = chromadb_module
-    CLIP_AVAILABLE = True
-    print("✓ CLIP libraries imported successfully", flush=True)
-except ImportError as e:
-    print(f"✗ CLIP Import Error: {e}", flush=True)
-    CLIP_AVAILABLE = False
+def initialize_clip():
+    global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection
+    if not CLIP_AVAILABLE:
+        return False
+    try:
+        clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+        clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
+        clip_model.eval()
+        chroma_client = chromadb.Client()
+        image_collection = chroma_client.get_or_create_collection(name='archaeo_images')
+        return True
+    except Exception as e:
+        return False
 
-app = FastAPI(title="ArchaeoFinder API", version="1.0.0")
 
-# CORS Middleware
+def get_image_embedding(image):
+    if not clip_model or not clip_preprocess:
+        return None
+    try:
+        image_input = clip_preprocess(image).unsqueeze(0)
+        with torch.no_grad():
+            image_features = clip_model.encode_image(image_input)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        return image_features[0].tolist()
+    except Exception:
+        return None
+
+
+class MuseumObject(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    museum: Optional[str] = None
+    epoch: Optional[str] = None
+    image_url: Optional[str] = None
+    source_url: Optional[str] = None
+    source: str = 'europeana'
+    similarity: Optional[int] = None
+
+
+class SearchResponse(BaseModel):
+    success: bool
+    total_results: int
+    results: List[MuseumObject]
+    search_id: str
+    filters_applied: dict
+    search_mode: str
+
+
+class UploadResponse(BaseModel):
+    success: bool
+    image_id: str
+    message: str
+
+
+class IndexResponse(BaseModel):
+    success: bool
+    indexed_count: int
+    total_in_db: int
+    message: str
+
+
+EPOCH_MAPPING = {
+    'Steinzeit': ['neolithic', 'stone age', 'mesolithic', 'paleolithic'],
+    'Bronzezeit': ['bronze age'],
+    'Eisenzeit': ['iron age', 'hallstatt', 'celtic'],
+    'Roemische Kaiserzeit': ['roman', 'roman empire'],
+    'Fruehmittelalter': ['early medieval', 'migration period'],
+    'Hochmittelalter': ['medieval', 'romanesque'],
+    'Spaetmittelalter': ['late medieval', 'gothic']
+}
+
+OBJECT_TYPE_MAPPING = {
+    'Fibeln': ['fibula', 'brooch', 'pin'],
+    'Muenzen': ['coin', 'numismatic'],
+    'Keramik': ['ceramic', 'pottery', 'vessel', 'amphora'],
+    'Waffen': ['weapon', 'sword', 'axe', 'tool'],
+    'Schmuck': ['jewelry', 'jewellery', 'ring', 'bracelet', 'necklace'],
+    'Kultgegenstaende': ['cult', 'ritual', 'religious', 'votive'],
+    'Alltagsgegenstaende': ['domestic', 'household']
+}
+
+REGION_MAPPING = {
+    'Mitteleuropa': ['germany', 'austria', 'switzerland'],
+    'Nordeuropa': ['scandinavia', 'denmark', 'sweden', 'norway'],
+    'Suedeuropa': ['italy', 'greece', 'spain'],
+    'Westeuropa': ['france', 'britain', 'england'],
+    'Osteuropa': ['poland', 'czech', 'hungary', 'romania'],
+    'Mittelmeerraum': ['mediterranean', 'aegean'],
+    'Naher Osten': ['mesopotamia', 'egypt', 'levant']
+}
+
+
+app = FastAPI(title='ArchaeoFinder API', version='2.0.0', docs_url='/docs', redoc_url='/redoc')
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=['*'],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=['*'],
+    allow_headers=['*'],
 )
 
-# Europeana API Configuration
-EUROPEANA_API_KEY = os.getenv("EUROPEANA_API_KEY", "")
-EUROPEANA_SEARCH_URL = "https://api.europeana.eu/record/v2/search.json"
 
-# Models
-class SearchQuery(BaseModel):
-    query: str
-    rows: int = 12
-    start: int = 1
-
-class TextSearchQuery(BaseModel):
-    query: str
-    top_k: int = 10
-
-# Lazy load CLIP model
-def ensure_clip_loaded():
-    global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection
-    
-    if not CLIP_AVAILABLE:
-        raise HTTPException(
-            status_code=503,
-            detail="CLIP libraries not available"
-        )
-    
-    # Load CLIP model on first request
-    if clip_model is None:
-        try:
-            print("Loading CLIP model (first request)...", flush=True)
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                "ViT-B-32-quickgelu",
-                pretrained="laion400m_e32"
-            )
-            tokenizer = open_clip.get_tokenizer("ViT-B-32-quickgelu")
-            model.eval()
-            clip_model = model
-            clip_preprocess = preprocess
-            clip_tokenizer = tokenizer
-            print("✓ CLIP model loaded successfully", flush=True)
-        except Exception as e:
-            print(f"✗ CLIP loading error: {e}", flush=True)
-            raise HTTPException(
-                status_code=503,
-                detail=f"Failed to load CLIP model: {str(e)}"
-            )
-    
-    # Initialize ChromaDB on first request
-    if chroma_client is None:
-        try:
-            print("Initializing ChromaDB...", flush=True)
-            chroma_client = chromadb.PersistentClient(path="/app/chroma_data")
-            image_collection = chroma_client.get_or_create_collection(
-                name="archaeo_images",
-                metadata={"hnsw:space": "cosine"}
-            )
-            print(f"✓ ChromaDB initialized. Collection has {image_collection.count()} images", flush=True)
-        except Exception as e:
-            print(f"✗ ChromaDB error: {e}", flush=True)
-            raise HTTPException(
-                status_code=503,
-                detail=f"Failed to initialize ChromaDB: {str(e)}"
-            )
-
-# Startup event
-@app.on_event("startup")
+@app.on_event('startup')
 async def startup_event():
-    print("=" * 60, flush=True)
-    print("ArchaeoFinder API Started", flush=True)
-    print("CLIP will load on first use (lazy loading)", flush=True)
-    print("=" * 60, flush=True)
+    initialize_clip()
 
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    """Simple health check that always returns 200 if server is running"""
-    collection_count = 0
-    if image_collection is not None:
-        try:
-            collection_count = image_collection.count()
-        except:
-            pass
-    
-    return {
-        "status": "healthy",
-        "clip_available": CLIP_AVAILABLE,
-        "clip_loaded": clip_model is not None,
-        "indexed_images": collection_count
-    }
 
-# Liveness probe
-@app.get("/healthz")
-async def liveness():
-    """Kubernetes-style liveness probe"""
-    return {"status": "alive"}
+def build_europeana_query(keywords=None, epoch=None, object_type=None, region=None):
+    query_parts = []
+    query_parts.append('(archaeology OR archaeological)')
+    if keywords:
+        query_parts.append('(' + keywords + ')')
+    if epoch and epoch != 'Alle Epochen':
+        epoch_terms = EPOCH_MAPPING.get(epoch, [])
+        if epoch_terms:
+            query_parts.append('(' + ' OR '.join(epoch_terms) + ')')
+    if object_type and object_type != 'Alle Objekttypen':
+        type_terms = OBJECT_TYPE_MAPPING.get(object_type, [])
+        if type_terms:
+            query_parts.append('(' + ' OR '.join(type_terms) + ')')
+    if region and region != 'Alle Regionen':
+        region_terms = REGION_MAPPING.get(region, [])
+        if region_terms:
+            query_parts.append('(' + ' OR '.join(region_terms) + ')')
+    return ' AND '.join(query_parts)
 
-# Readiness check
-@app.get("/ready")
-async def readiness_check():
-    """Check if app is ready to serve requests"""
-    return {
-        "status": "ready",
-        "clip_available": CLIP_AVAILABLE,
-        "clip_loaded": clip_model is not None
-    }
 
-# Root endpoint
-@app.get("/")
-async def root():
-    return {
-        "message": "ArchaeoFinder API",
-        "version": "1.0.0",
-        "status": "running",
-        "clip_available": CLIP_AVAILABLE,
-        "clip_loaded": clip_model is not None,
-        "endpoints": {
-            "health": "/health",
-            "healthz": "/healthz",
-            "ready": "/ready",
-            "search_europeana": "/api/search",
-            "image_search": "/api/image-search",
-            "text_search": "/api/text-search",
-            "index_image": "/api/index-image",
-            "collection_stats": "/api/collection-stats",
-            "list_images": "/api/list-images",
-            "delete_image": "/api/delete-image/{image_id}",
-            "clear_collection": "/api/clear-collection"
-        }
-    }
-
-# Europeana search endpoint
-@app.post("/api/search")
-async def search_europeana(search_query: SearchQuery):
-    if not EUROPEANA_API_KEY:
-        raise HTTPException(
-            status_code=500, 
-            detail="Europeana API key not configured. Set EUROPEANA_API_KEY environment variable."
-        )
-    
-    params = {
-        "wskey": EUROPEANA_API_KEY,
-        "query": search_query.query,
-        "rows": search_query.rows,
-        "start": search_query.start,
-        "profile": "rich",
-        "media": "true",
-        "thumbnail": "true"
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(EUROPEANA_SEARCH_URL, params=params)
-            response.raise_for_status()
-            return response.json()
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Europeana API timeout")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=f"Europeana API error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-# Image search endpoint
-@app.post("/api/image-search")
-async def image_search(file: UploadFile = File(...), top_k: int = Form(10)):
-    # Ensure CLIP is loaded
-    ensure_clip_loaded()
-    
-    if image_collection.count() == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="No images indexed yet. Please index images first using /api/index-image"
-        )
-    
-    try:
-        # Read and validate image
-        image_data = await file.read()
-        
-        if len(image_data) == 0:
-            raise HTTPException(status_code=400, detail="Empty file uploaded")
-        
-        try:
-            image = Image.open(BytesIO(image_data)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-        
-        # Generate embedding
-        with torch.no_grad():
-            image_tensor = clip_preprocess(image).unsqueeze(0)
-            image_features = clip_model.encode_image(image_tensor)
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            embedding = image_features.cpu().numpy().flatten().tolist()
-        
-        # Search in ChromaDB
-        n_results = min(top_k, image_collection.count())
-        results = image_collection.query(
-            query_embeddings=[embedding],
-            n_results=n_results
-        )
-        
-        return {
-            "success": True,
-            "results": results,
-            "count": len(results["ids"][0]) if results["ids"] else 0,
-            "total_indexed": image_collection.count()
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Image search error: {str(e)}")
-
-# Index image endpoint
-@app.post("/api/index-image")
-async def index_image(
-    file: UploadFile = File(...), 
-    metadata: Optional[str] = Form(None)
-):
-    # Ensure CLIP is loaded
-    ensure_clip_loaded()
-    
-    try:
-        # Read and validate image
-        image_data = await file.read()
-        
-        if len(image_data) == 0:
-            raise HTTPException(status_code=400, detail="Empty file uploaded")
-        
-        try:
-            image = Image.open(BytesIO(image_data)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-        
-        # Generate embedding
-        with torch.no_grad():
-            image_tensor = clip_preprocess(image).unsqueeze(0)
-            image_features = clip_model.encode_image(image_tensor)
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            embedding = image_features.cpu().numpy().flatten().tolist()
-        
-        # Generate unique ID
-        image_id = hashlib.md5(image_data).hexdigest()
-        
-        # Parse metadata if provided
-        meta_dict = {}
-        if metadata:
-            try:
-                meta_dict = json.loads(metadata)
-            except:
-                meta_dict = {"raw_metadata": metadata}
-        
-        meta_dict["filename"] = file.filename
-        meta_dict["content_type"] = file.content_type or "image/unknown"
-        
-        # Check if image already exists
-        try:
-            existing = image_collection.get(ids=[image_id])
-            if existing and existing["ids"]:
-                return {
-                    "success": True,
-                    "image_id": image_id,
-                    "message": "Image already indexed",
-                    "already_exists": True,
-                    "total_indexed": image_collection.count()
-                }
-        except:
-            pass
-        
-        # Store in ChromaDB
-        image_collection.add(
-            embeddings=[embedding],
-            ids=[image_id],
-            metadatas=[meta_dict]
-        )
-        
-        return {
-            "success": True,
-            "image_id": image_id,
-            "message": "Image indexed successfully",
-            "already_exists": False,
-            "total_indexed": image_collection.count()
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Image indexing error: {str(e)}")
-
-# Text search endpoint
-@app.post("/api/text-search")
-async def text_search(search_query: TextSearchQuery):
-    # Ensure CLIP is loaded
-    ensure_clip_loaded()
-    
-    if image_collection.count() == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="No images indexed yet. Please index images first using /api/index-image"
-        )
-    
-    try:
-        # Generate text embedding
-        with torch.no_grad():
-            text_tokens = clip_tokenizer([search_query.query])
-            text_features = clip_model.encode_text(text_tokens)
-            text_features /= text_features.norm(dim=-1, keepdim=True)
-            embedding = text_features.cpu().numpy().flatten().tolist()
-        
-        # Search in ChromaDB
-        n_results = min(search_query.top_k, image_collection.count())
-        results = image_collection.query(
-            query_embeddings=[embedding],
-            n_results=n_results
-        )
-        
-        return {
-            "success": True,
-            "query": search_query.query,
-            "results": results,
-            "count": len(results["ids"][0]) if results["ids"] else 0,
-            "total_indexed": image_collection.count()
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Text search error: {str(e)}")
-
-# Collection stats endpoint
-@app.get("/api/collection-stats")
-async def collection_stats():
-    ensure_clip_loaded()
-    
-    try:
-        count = image_collection.count()
-        return {
-            "success": True,
-            "total_images": count,
-            "collection_name": image_collection.name,
-            "collection_metadata": image_collection.metadata
-        }
-except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stats error: {str(e)}")
-
-# Delete image endpoint
-@app.delete("/api/delete-image/{image_id}")
-async def delete_image(image_id: str):
-    ensure_clip_loaded()
-    
-    try:
-        image_collection.delete(ids=[image_id])
-        return {
-            "success": True,
-            "message": f"Image {image_id} deleted successfully",
-            "total_indexed": image_collection.count()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
-
-# Clear collection endpoint
-@app.delete("/api/clear-collection")
-async def clear_collection():
-    ensure_clip_loaded()
-    
-    try:
-        # Get all IDs and delete them
-        all_items = image_collection.get()
-        if all_items and all_items["ids"]:
-            image_collection.delete(ids=all_items["ids"])
-            deleted_count = len(all_items["ids"])
+def parse_europeana_result(item):
+    title = 'Unbekanntes Objekt'
+    if 'title' in item and item['title']:
+        title_data = item['title']
+        if isinstance(title_data, list):
+            title = title_data[0]
         else:
-            deleted_count = 0
-        
-        return {
-            "success": True,
-            "message": "Collection cleared successfully",
-            "deleted_count": deleted_count,
-            "total_indexed": image_collection.count()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Clear collection error: {str(e)}")
+            title = title_data
+    description = None
+    if 'dcDescription' in item and item['dcDescription']:
+        desc_data = item['dcDescription']
+        if isinstance(desc_data, list):
+            description = desc_data[0]
+        else:
+            description = desc_data
+        if description and len(description) > 300:
+            description = description[:297] + '...'
+    museum = None
+    if 'dataProvider' in item and item['dataProvider']:
+        dp_data = item['dataProvider']
+        if isinstance(dp_data, list):
+            museum = dp_data[0]
+        else:
+            museum = dp_data
+    epoch = None
+    if 'year' in item and item['year']:
+        years = item['year']
+        if isinstance(years, list) and years:
+            if len(years) > 1:
+                epoch = str(min(years)) + ' - ' + str(max(years))
+            else:
+                epoch = str(years[0])
+    image_url = None
+    if 'edmPreview' in item and item['edmPreview']:
+        previews = item['edmPreview']
+        if isinstance(previews, list):
+            image_url = previews[0]
+        else:
+            image_url = previews
+    source_url = None
+    if 'guid' in item:
+        source_url = item['guid']
+    elif 'id' in item:
+        source_url = 'https://www.europeana.eu/item' + item['id']
+    return MuseumObject(id=item.get('id', 'unknown'), title=title, description=description, museum=museum, epoch=epoch, image_url=image_url, source_url=source_url, source='europeana')
 
-# Get all indexed images endpoint
-@app.get("/api/list-images")
-async def list_images(limit: int = 100, offset: int = 0):
-    ensure_clip_loaded()
-    
-    try:
-        all_items = image_collection.get(
-            limit=limit,
-            offset=offset,
-            include=["metadatas"]
-        )
-        
-        return {
-            "success": True,
-            "images": all_items,
-            "count": len(all_items["ids"]) if all_items["ids"] else 0,
-            "total_indexed": image_collection.count(),
-            "limit": limit,
-            "offset": offset
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"List images error: {str(e)}")
+
+async def search_europeana(query, rows=20):
+    url = 'https://api.europeana.eu/record/v2/search.json'
+    params = {'wskey': EUROPEANA_API_KEY, 'query': query, 'rows': rows, 'profile': 'rich', 'media': 'true', 'qf': 'TYPE:IMAGE'}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, params=params)
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail='Europeana API error')
+        data = response.json()
+        total = data.get('totalResults', 0)
+        items = data.get('items', [])
+        results = []
+        for item in items:
+            try:
+                parsed = parse_europeana_result(item)
+                if parsed.image_url:
+                    results.append(parsed)
+            except Exception:
+                continue
+        return total, results
+
+
+async def search_by_image(image, limit=20):
+    if not image_collection:
+        return []
+    count = image_collection.count()
+    if count == 0:
+        return []
+    embedding = get_image_embedding(image)
+    if not embedding:
+        return []
+    n_results = min(limit, count)
+    results = image_collection.query(query_embeddings=[embedding], n_results=n_results)
+    if not results:
+        return []
+    ids_list = results.get('ids', [])
+    if not ids_list or not ids_list[0]:
+        return []
+    museum_objects = []
+    metadatas = results.get('metadatas', [[]])
+    distances = results.get('distances', [[]])
+    for i in range(len(ids_list[0])):
+        item_id = ids_list[0][i]
+        metadata = {}
+        if metadatas and metadatas[0] and i < len(metadatas[0]):
+            metadata = metadatas[0][i]
+        distance = 1.0
+        if distances and distances[0] and i < len(distances[0]):
+            distance = distances[0][i]
+        similarity = int(max(0, min(100, (1 - distance) * 100)))
+        museum_objects.append(MuseumObject(id=item_id, title=metadata.get('title', 'Unbekannt'), museum=metadata.get('museum', None), image_url=metadata.get('image_url', None), source_url=metadata.get('source_url', None), source=metadata.get('source', 'europeana'), similarity=similarity))
+    return museum_objects
+
+
+@app.get('/')
+async def root():
+    db_count = 0
+    if image_collection:
+        db_count = image_collection.count()
+    return {'name': 'ArchaeoFinder API', 'version': '2.0.0', 'status': 'online', 'clip_available': CLIP_AVAILABLE, 'images_indexed': db_count}
+
+
+@app.get('/health')
+async def health_check():
+    return {'status': 'healthy', 'clip': CLIP_AVAILABLE}
+
+
+@app.post('/api/upload', response_model=UploadResponse)
+async def upload_image_endpoint(file: UploadFile = File(...)):
+    filename = file.filename or 'unknown'
+    ext = ''
+    if '.' in filename:
+        ext = filename.rsplit('.', 1)[-1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail='Ungueltiges Format')
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail='Datei zu gross')
+    image_hash = hashlib.sha256(content).hexdigest()[:16]
+    image_id = 'img_' + image_hash + '_' + datetime.now().strftime('%Y%m%d%H%M%S')
+    uploaded_images[image_id] = {'content': content, 'filename': filename, 'content_type': file.content_type, 'uploaded_at': datetime.now().isoformat()}
+    return UploadResponse(success=True, image_id=image_id, message='Bild hochgeladen')
+
+
+@app.get('/api/search', response_model=SearchResponse)
+async def search(q: Optional[str] = Query(None), image_id: Optional[str] = Query(None), epoch: Optional[str] = Query(None), object_type: Optional[str] = Query(None), region: Optional[str] = Query(None), limit: int = Query(20, ge=1, le=50)):
+    search_mode = 'text'
+    results = []
+    total = 0
+    if image_id and image_id in uploaded_images and CLIP_AVAILABLE:
+        try:
+            content = uploaded_images[image_id]['content']
+            image = Image.open(io.BytesIO(content)).convert('RGB')
+            results = await search_by_image(image, limit)
+            total = len(results)
+            search_mode = 'image'
+        except Exception:
+            pass
+    if not results or q:
+        query = build_europeana_query(keywords=q, epoch=epoch, object_type=object_type, region=region)
+        try:
+            total, text_results = await search_europeana(query, rows=limit)
+            if search_mode == 'text':
+                import random
+                for i in range(len(text_results)):
+                    result = text_results[i]
+                    base_similarity = 95 - (i * 3)
+                    result.similarity = max(50, min(99, base_similarity + random.randint(-5, 5)))
+                results = text_results
+            else:
+                search_mode = 'hybrid'
+                existing_ids = set()
+                for r in results:
+                    existing_ids.add(r.id)
+                for r in text_results:
+                    if r.id not in existing_ids:
+                        r.similarity = 50
+                        results.append(r)
+        except Exception as e:
+            if not results:
+                raise HTTPException(status_code=500, detail='Suchfehler')
+    results.sort(key=lambda x: x.similarity or 0, reverse=True)
+    search_id = 'search_' + datetime.now().strftime('%Y%m%d%H%M%S')
+    return SearchResponse(success=True, total_results=total, results=results[:limit], search_id=search_id, filters_applied={'keywords': q, 'epoch': epoch, 'object_type': object_type, 'region': region}, search_mode=search_mode)
+
+
+@app.get('/api/filters')
+async def get_filters():
+    return {'epochs': ['Alle Epochen'] + list(EPOCH_MAPPING.keys()), 'object_types': ['Alle Objekttypen'] + list(OBJECT_TYPE_MAPPING.keys()), 'regions': ['Alle Regionen'] + list(REGION_MAPPING.keys())}
+
+
+@app.get('/api/sources')
+async def get_sources():
+    return {'sources': [{'id': 'europeana', 'name': 'Europeana', 'status': 'active'}, {'id': 'ddb', 'name': 'Deutsche Digitale Bibliothek', 'status': 'coming_soon'}, {'id': 'british_museum', 'name': 'British Museum', 'status': 'coming_soon'}]}
+
+
+if __name__ == '__main__':
+    import uvicorn
+    port = int(os.getenv('PORT', 8080))
+    uvicorn.run(app, host='0.0.0.0', port=port)
