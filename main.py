@@ -10,6 +10,11 @@ import hashlib
 from datetime import datetime
 import os
 import io
+import asyncio
+
+CLIP_AVAILABLE = False
+CLIP_LOADING = False
+CLIP_LOADED = False
 
 try:
     import torch
@@ -32,19 +37,22 @@ chroma_client = None
 image_collection = None
 uploaded_images = {}
 
-def initialize_clip():
-    global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection
-    if not CLIP_AVAILABLE:
-        return False
+
+def load_clip_model():
+    global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection, CLIP_LOADED, CLIP_LOADING
+    if not CLIP_AVAILABLE or CLIP_LOADING or CLIP_LOADED:
+        return
+    CLIP_LOADING = True
     try:
         clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
         clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
         clip_model.eval()
         chroma_client = chromadb.Client()
         image_collection = chroma_client.get_or_create_collection(name='archaeo_images')
-        return True
+        CLIP_LOADED = True
     except Exception as e:
-        return False
+        pass
+    CLIP_LOADING = False
 
 
 def get_image_embedding(image):
@@ -84,13 +92,6 @@ class SearchResponse(BaseModel):
 class UploadResponse(BaseModel):
     success: bool
     image_id: str
-    message: str
-
-
-class IndexResponse(BaseModel):
-    success: bool
-    indexed_count: int
-    total_in_db: int
     message: str
 
 
@@ -138,7 +139,12 @@ app.add_middleware(
 
 @app.on_event('startup')
 async def startup_event():
-    initialize_clip()
+    asyncio.create_task(load_clip_background())
+
+
+async def load_clip_background():
+    await asyncio.sleep(5)
+    load_clip_model()
 
 
 def build_europeana_query(keywords=None, epoch=None, object_type=None, region=None):
@@ -266,12 +272,12 @@ async def root():
     db_count = 0
     if image_collection:
         db_count = image_collection.count()
-    return {'name': 'ArchaeoFinder API', 'version': '2.0.0', 'status': 'online', 'clip_available': CLIP_AVAILABLE, 'images_indexed': db_count}
+    return {'name': 'ArchaeoFinder API', 'version': '2.0.0', 'status': 'online', 'clip_available': CLIP_AVAILABLE, 'clip_loaded': CLIP_LOADED, 'images_indexed': db_count}
 
 
 @app.get('/health')
 async def health_check():
-    return {'status': 'healthy', 'clip': CLIP_AVAILABLE}
+    return {'status': 'healthy'}
 
 
 @app.post('/api/upload', response_model=UploadResponse)
@@ -296,7 +302,7 @@ async def search(q: Optional[str] = Query(None), image_id: Optional[str] = Query
     search_mode = 'text'
     results = []
     total = 0
-    if image_id and image_id in uploaded_images and CLIP_AVAILABLE:
+    if image_id and image_id in uploaded_images and CLIP_LOADED:
         try:
             content = uploaded_images[image_id]['content']
             image = Image.open(io.BytesIO(content)).convert('RGB')
