@@ -1,30 +1,18 @@
-# ArchaeoFinder Backend Phase 2
+# ArchaeoFinder Backend Phase 2 - Lazy Loading
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import httpx
-import base64
 import hashlib
 from datetime import datetime
 import os
 import io
-import asyncio
+import threading
 
 CLIP_AVAILABLE = False
-CLIP_LOADING = False
 CLIP_LOADED = False
-
-try:
-    import torch
-    import open_clip
-    from PIL import Image
-    import chromadb
-    import numpy as np
-    CLIP_AVAILABLE = True
-except ImportError as e:
-    CLIP_AVAILABLE = False
 
 EUROPEANA_API_KEY = os.getenv('EUROPEANA_API_KEY', 'api2demo')
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -32,33 +20,33 @@ ALLOWED_EXTENSIONS = set(['jpg', 'jpeg', 'png', 'webp', 'gif'])
 
 clip_model = None
 clip_preprocess = None
-clip_tokenizer = None
 chroma_client = None
 image_collection = None
 uploaded_images = {}
 
 
-def load_clip_model():
-    global clip_model, clip_preprocess, clip_tokenizer, chroma_client, image_collection, CLIP_LOADED, CLIP_LOADING
-    if not CLIP_AVAILABLE or CLIP_LOADING or CLIP_LOADED:
-        return
-    CLIP_LOADING = True
+def load_clip_in_background():
+    global clip_model, clip_preprocess, chroma_client, image_collection, CLIP_AVAILABLE, CLIP_LOADED
     try:
+        import torch
+        import open_clip
+        import chromadb
+        CLIP_AVAILABLE = True
         clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
-        clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
         clip_model.eval()
         chroma_client = chromadb.Client()
         image_collection = chroma_client.get_or_create_collection(name='archaeo_images')
         CLIP_LOADED = True
-    except Exception as e:
-        pass
-    CLIP_LOADING = False
+    except Exception:
+        CLIP_AVAILABLE = False
+        CLIP_LOADED = False
 
 
 def get_image_embedding(image):
     if not clip_model or not clip_preprocess:
         return None
     try:
+        import torch
         image_input = clip_preprocess(image).unsqueeze(0)
         with torch.no_grad():
             image_features = clip_model.encode_image(image_input)
@@ -139,12 +127,8 @@ app.add_middleware(
 
 @app.on_event('startup')
 async def startup_event():
-    asyncio.create_task(load_clip_background())
-
-
-async def load_clip_background():
-    await asyncio.sleep(5)
-    load_clip_model()
+    thread = threading.Thread(target=load_clip_in_background, daemon=True)
+    thread.start()
 
 
 def build_europeana_query(keywords=None, epoch=None, object_type=None, region=None):
@@ -282,6 +266,7 @@ async def health_check():
 
 @app.post('/api/upload', response_model=UploadResponse)
 async def upload_image_endpoint(file: UploadFile = File(...)):
+    from PIL import Image as PILImage
     filename = file.filename or 'unknown'
     ext = ''
     if '.' in filename:
@@ -299,13 +284,14 @@ async def upload_image_endpoint(file: UploadFile = File(...)):
 
 @app.get('/api/search', response_model=SearchResponse)
 async def search(q: Optional[str] = Query(None), image_id: Optional[str] = Query(None), epoch: Optional[str] = Query(None), object_type: Optional[str] = Query(None), region: Optional[str] = Query(None), limit: int = Query(20, ge=1, le=50)):
+    from PIL import Image as PILImage
     search_mode = 'text'
     results = []
     total = 0
     if image_id and image_id in uploaded_images and CLIP_LOADED:
         try:
             content = uploaded_images[image_id]['content']
-            image = Image.open(io.BytesIO(content)).convert('RGB')
+            image = PILImage.open(io.BytesIO(content)).convert('RGB')
             results = await search_by_image(image, limit)
             total = len(results)
             search_mode = 'image'
