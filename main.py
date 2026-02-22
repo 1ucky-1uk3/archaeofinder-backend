@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Query, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import httpx
@@ -14,7 +15,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("archaeofinder")
 
-app = FastAPI(title="ArchaeoFinder API", version="3.3.0")
+app = FastAPI(title="ArchaeoFinder API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -499,8 +500,8 @@ async def root():
     if API_KEYS["rijksmuseum"]: enabled.append("rijksmuseum")
     if API_KEYS["smithsonian"]: enabled.append("smithsonian")
     if API_KEYS["harvard"]: enabled.append("harvard")
-    return {"name": "ArchaeoFinder API", "version": "3.3.0", "status": "online",
-        "features": ["multi_museum_search", "user_auth", "save_finds", "smart_filters", "deduplication", "caching", "api_health_tracking", "live_status"],
+    return {"name": "ArchaeoFinder API", "version": "4.0.0", "status": "online",
+        "features": ["multi_museum_search", "user_auth", "save_finds", "smart_filters", "deduplication", "caching", "api_health_tracking", "live_status", "image_proxy"],
         "enabled_apis": enabled, "total_sources": len(enabled)}
 
 # =============================================================================
@@ -621,6 +622,57 @@ async def api_status_endpoint():
         "apis": apis,
         "last_search_health": _api_health,
     }
+
+# =============================================================================
+# IMAGE PROXY — Bypass CORS for visual reranking (Phase 2)
+# =============================================================================
+
+_image_cache: Dict[str, tuple] = {}  # url -> (content_bytes, content_type, timestamp)
+IMAGE_CACHE_TTL = 3600  # 1 hour
+IMAGE_CACHE_MAX = 200   # max cached images
+
+@app.get("/api/image-proxy")
+async def image_proxy(url: str = Query(..., description="Image URL to proxy")):
+    """Proxy museum images to bypass CORS for CLIP embedding computation in browser."""
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    
+    # Check cache
+    now = time.time()
+    if url in _image_cache:
+        content, ctype, ts = _image_cache[url]
+        if now - ts < IMAGE_CACHE_TTL:
+            return Response(content=content, media_type=ctype,
+                headers={"Cache-Control": "public, max-age=86400", "X-Cache": "HIT"})
+    
+    # Fetch image
+    try:
+        client = await get_http_client()
+        resp = await client.get(url, timeout=15.0)
+        resp.raise_for_status()
+        
+        ctype = resp.headers.get("content-type", "image/jpeg")
+        if not ctype.startswith("image/"):
+            raise HTTPException(status_code=400, detail="URL is not an image")
+        
+        content = resp.content
+        if len(content) > 10_000_000:  # 10MB limit
+            raise HTTPException(status_code=413, detail="Image too large")
+        
+        # Cache it (evict oldest if full)
+        if len(_image_cache) >= IMAGE_CACHE_MAX:
+            oldest_key = min(_image_cache, key=lambda k: _image_cache[k][2])
+            del _image_cache[oldest_key]
+        _image_cache[url] = (content, ctype, now)
+        
+        return Response(content=content, media_type=ctype,
+            headers={"Cache-Control": "public, max-age=86400", "X-Cache": "MISS"})
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Image fetch timeout")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Image fetch failed: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Image proxy error: {str(e)}")
 
 @app.get("/api/search")
 async def search(
