@@ -15,7 +15,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("archaeofinder")
 
-app = FastAPI(title="ArchaeoFinder API", version="4.0.0")
+app = FastAPI(title="ArchaeoFinder API", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +37,7 @@ API_KEYS = {
     "smithsonian": os.getenv("SMITHSONIAN_API_KEY", ""),
     "harvard": os.getenv("HARVARD_API_KEY", ""),
     "rijksmuseum": os.getenv("RIJKSMUSEUM_API_KEY", ""),
+    "cooper_hewitt": os.getenv("COOPER_HEWITT_API_KEY", ""),
 }
 
 # =============================================================================
@@ -478,9 +479,309 @@ async def search_harvard(client, query, limit=20, epoch=None, material=None):
         record_api_health("harvard", f"error: {type(e).__name__}", ms)
         return {"results": [], "source": "harvard", "status": f"error: {type(e).__name__}"}
 
-# =============================================================================
-# ENDPOINTS
-# =============================================================================
+# ── Cleveland Museum of Art (Public, no key) ──
+
+async def search_cleveland(client, query, limit=20, epoch=None, material=None):
+    cache_key = ("cleveland", query, limit, epoch, material)
+    cached = search_cache.get(*cache_key)
+    if cached is not None:
+        return {"results": cached, "source": "cleveland", "status": "cached"}
+    t0 = time.time()
+    try:
+        params = {"q": query, "has_image": 1, "limit": min(limit, 20), "indent": 0}
+        response = await client.get("https://openaccess-api.clevelandart.org/api/artworks/", params=params, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for item in data.get("data", []):
+            img = None
+            if item.get("images") and item["images"].get("web"):
+                img = item["images"]["web"].get("url")
+            if not img:
+                continue
+            results.append({"id": f"cma_{item.get('id', '')}", "title": item.get("title", "Unbekannt"),
+                "image_url": img, "source": "Cleveland Museum",
+                "source_url": item.get("url", f"https://clevelandart.org/art/{item.get('accession_number', '')}"),
+                "museum": "Cleveland Museum of Art",
+                "epoch": item.get("creation_date", ""),
+                "material": item.get("technique", "") or item.get("type", "")})
+        ms = (time.time() - t0) * 1000
+        search_cache.set(results, *cache_key)
+        record_api_health("cleveland", "ok", ms, len(results))
+        return {"results": results, "source": "cleveland", "status": "ok", "count": len(results)}
+    except Exception as e:
+        ms = (time.time() - t0) * 1000
+        record_api_health("cleveland", f"error: {type(e).__name__}", ms)
+        logger.warning(f"Cleveland error: {e}")
+        return {"results": [], "source": "cleveland", "status": f"error: {type(e).__name__}"}
+
+# ── Art Institute of Chicago (Public, no key) ──
+
+async def search_chicago(client, query, limit=20, epoch=None, material=None):
+    cache_key = ("chicago", query, limit, epoch, material)
+    cached = search_cache.get(*cache_key)
+    if cached is not None:
+        return {"results": cached, "source": "chicago", "status": "cached"}
+    t0 = time.time()
+    try:
+        params = {"q": query, "limit": min(limit, 20),
+            "fields": "id,title,image_id,date_display,medium_display,artist_display,artwork_type_title",
+            "query[term][is_public_domain]": "true"}
+        response = await client.get("https://api.artic.edu/api/v1/artworks/search", params=params, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        iiif_base = data.get("config", {}).get("iiif_url", "https://www.artic.edu/iiif/2")
+        results = []
+        for item in data.get("data", []):
+            img_id = item.get("image_id")
+            if not img_id:
+                continue
+            img_url = f"{iiif_base}/{img_id}/full/843,/0/default.jpg"
+            results.append({"id": f"aic_{item.get('id', '')}", "title": item.get("title", "Unbekannt"),
+                "image_url": img_url, "source": "Art Institute Chicago",
+                "source_url": f"https://www.artic.edu/artworks/{item.get('id', '')}",
+                "museum": "Art Institute of Chicago",
+                "epoch": item.get("date_display", ""),
+                "material": item.get("medium_display", "")})
+        ms = (time.time() - t0) * 1000
+        search_cache.set(results, *cache_key)
+        record_api_health("chicago", "ok", ms, len(results))
+        return {"results": results, "source": "chicago", "status": "ok", "count": len(results)}
+    except Exception as e:
+        ms = (time.time() - t0) * 1000
+        record_api_health("chicago", f"error: {type(e).__name__}", ms)
+        logger.warning(f"Chicago AIC error: {e}")
+        return {"results": [], "source": "chicago", "status": f"error: {type(e).__name__}"}
+
+# ── Cooper Hewitt, Smithsonian Design Museum (API key optional) ──
+
+async def search_cooper_hewitt(client, query, limit=20, epoch=None, material=None):
+    if not API_KEYS["cooper_hewitt"]:
+        return {"results": [], "source": "cooper_hewitt", "status": "disabled"}
+    cache_key = ("cooper_hewitt", query, limit, epoch, material)
+    cached = search_cache.get(*cache_key)
+    if cached is not None:
+        return {"results": cached, "source": "cooper_hewitt", "status": "cached"}
+    t0 = time.time()
+    try:
+        params = {"method": "cooperhewitt.search.objects", "access_token": API_KEYS["cooper_hewitt"],
+            "query": query, "has_images": 1, "per_page": min(limit, 20), "page": 1}
+        response = await client.get("https://api.collection.cooperhewitt.org/rest/", params=params, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for item in data.get("objects", []):
+            imgs = item.get("images", [])
+            img = None
+            if imgs:
+                for img_entry in imgs:
+                    for sz in ["n", "z", "b", "sq"]:
+                        if img_entry.get(sz) and img_entry[sz].get("url"):
+                            img = img_entry[sz]["url"]; break
+                    if img: break
+            if not img:
+                continue
+            results.append({"id": f"ch_{item.get('id', '')}", "title": item.get("title", "Unbekannt"),
+                "image_url": img, "source": "Cooper Hewitt",
+                "source_url": item.get("url", ""),
+                "museum": "Cooper Hewitt, Smithsonian Design Museum",
+                "epoch": item.get("date", ""),
+                "material": item.get("medium", "")})
+        ms = (time.time() - t0) * 1000
+        search_cache.set(results, *cache_key)
+        record_api_health("cooper_hewitt", "ok", ms, len(results))
+        return {"results": results, "source": "cooper_hewitt", "status": "ok", "count": len(results)}
+    except Exception as e:
+        ms = (time.time() - t0) * 1000
+        record_api_health("cooper_hewitt", f"error: {type(e).__name__}", ms)
+        logger.warning(f"Cooper Hewitt error: {e}")
+        return {"results": [], "source": "cooper_hewitt", "status": f"error: {type(e).__name__}"}
+
+# ── Walters Art Museum (API v1 retired 2023, awaiting v2) ──
+
+async def search_walters(client, query, limit=20, epoch=None, material=None):
+    # Walters API v1 was retired in late 2023. No v2 available yet.
+    # See: https://github.com/WaltersArtMuseum/walters-api
+    # Keeping function for forward-compatibility when v2 launches.
+    record_api_health("walters", "offline", 0, 0)
+    return {"results": [], "source": "walters", "status": "offline", "message": "API v1 retired 2023, awaiting v2"}
+
+# ── Yale University Art Gallery via LUX API (Public, no key) ──
+
+async def search_yale_lux(client, query, limit=20, epoch=None, material=None):
+    cache_key = ("yale_lux", query, limit, epoch, material)
+    cached = search_cache.get(*cache_key)
+    if cached is not None:
+        return {"results": cached, "source": "yale", "status": "cached"}
+    t0 = time.time()
+    try:
+        import urllib.parse
+        lux_query = {"AND": [{"text": query}, {"hasDigitalImage": 1}]}
+        q_json = json.dumps(lux_query)
+        search_url = f"https://lux.collections.yale.edu/api/search/item?q={urllib.parse.quote(q_json)}&page=1&pageLength={min(limit, 20)}"
+        response = await client.get(search_url, timeout=12.0, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        data = response.json()
+        item_uris = [item.get("id", "") for item in data.get("orderedItems", []) if item.get("id")][:10]
+        if not item_uris:
+            ms = (time.time() - t0) * 1000
+            search_cache.set([], *cache_key)
+            record_api_health("yale", "ok", ms, 0)
+            return {"results": [], "source": "yale", "status": "ok", "count": 0}
+        async def fetch_lux_item(uri):
+            try:
+                r = await client.get(uri, timeout=6.0, headers={"Accept": "application/json"})
+                if r.status_code != 200:
+                    return None
+                obj = r.json()
+                title = "Unbekannt"
+                if obj.get("_label"):
+                    title = obj["_label"]
+                elif obj.get("identified_by"):
+                    for ident in obj["identified_by"]:
+                        if ident.get("type") == "Name" and ident.get("content"):
+                            title = ident["content"]; break
+                img = None
+                if obj.get("representation"):
+                    for rep in obj["representation"]:
+                        if rep.get("type") == "VisualItem" and rep.get("digitally_shown_by"):
+                            for dig in rep["digitally_shown_by"]:
+                                if dig.get("access_point"):
+                                    for ap in dig["access_point"]:
+                                        if ap.get("id") and ("iiif" in ap["id"] or ap["id"].endswith((".jpg", ".jpeg", ".png"))):
+                                            img = ap["id"]; break
+                                if img: break
+                        if img: break
+                if not img and obj.get("subject_of"):
+                    for sub in obj.get("subject_of", []):
+                        if sub.get("digitally_carried_by"):
+                            for dig in sub["digitally_carried_by"]:
+                                if dig.get("access_point"):
+                                    for ap in dig["access_point"]:
+                                        if ap.get("id"):
+                                            img = ap["id"]; break
+                if not img:
+                    return None
+                epoch_str = ""
+                if obj.get("produced_by") and obj["produced_by"].get("timespan"):
+                    ts = obj["produced_by"]["timespan"]
+                    epoch_str = ts.get("_label", ts.get("identified_by", [{}])[0].get("content", "") if ts.get("identified_by") else "")
+                obj_id = uri.split("/")[-1] if "/" in uri else uri
+                return {"id": f"yale_{obj_id}", "title": title,
+                    "image_url": img, "source": "Yale Gallery",
+                    "source_url": uri.replace("/data/", "/view/") if "/data/" in uri else uri,
+                    "museum": "Yale University Art Gallery", "epoch": epoch_str}
+            except:
+                return None
+        lux_results = await asyncio.gather(*[fetch_lux_item(uri) for uri in item_uris])
+        results = [r for r in lux_results if r is not None]
+        ms = (time.time() - t0) * 1000
+        search_cache.set(results, *cache_key)
+        record_api_health("yale", "ok", ms, len(results))
+        return {"results": results, "source": "yale", "status": "ok", "count": len(results)}
+    except Exception as e:
+        ms = (time.time() - t0) * 1000
+        record_api_health("yale", f"error: {type(e).__name__}", ms)
+        logger.warning(f"Yale LUX error: {e}")
+        return {"results": [], "source": "yale", "status": f"error: {type(e).__name__}"}
+
+# ── Musée du Louvre (No public REST search API — JSON only per-object via ark ID) ──
+# The Louvre provides JSON per-object at collections.louvre.fr/ark:/53355/{id}.json
+# but has NO search endpoint. We use Europeana's Louvre-filtered results as proxy.
+
+async def search_louvre(client, query, limit=20, epoch=None, material=None):
+    if not API_KEYS.get("europeana"):
+        return {"results": [], "source": "louvre", "status": "disabled", "message": "Needs Europeana key for Louvre proxy search"}
+    cache_key = ("louvre_proxy", query, limit, epoch, material)
+    cached = search_cache.get(*cache_key)
+    if cached is not None:
+        return {"results": cached, "source": "louvre", "status": "cached"}
+    t0 = time.time()
+    try:
+        search_q = f"{query} Louvre"
+        params = {
+            "wskey": API_KEYS["europeana"],
+            "query": search_q,
+            "rows": min(limit, 15),
+            "profile": "rich",
+            "qf": ["TYPE:IMAGE", "DATA_PROVIDER:\"Musée du Louvre\""]
+        }
+        response = await client.get("https://api.europeana.eu/record/v2/search.json", params=params, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for item in data.get("items", []):
+            img = None
+            if item.get("edmIsShownBy"):
+                img = item["edmIsShownBy"][0] if isinstance(item["edmIsShownBy"], list) else item["edmIsShownBy"]
+            elif item.get("edmPreview"):
+                img = item["edmPreview"][0] if isinstance(item["edmPreview"], list) else item["edmPreview"]
+            if not img:
+                continue
+            title = item.get("title", ["Unbekannt"])[0] if isinstance(item.get("title"), list) else item.get("title", "Unbekannt")
+            results.append({"id": f"louvre_{item.get('id', '')}", "title": title,
+                "image_url": img, "source": "Louvre (via Europeana)",
+                "source_url": item.get("guid", ""),
+                "museum": "Musée du Louvre",
+                "epoch": "", "material": ""})
+        ms = (time.time() - t0) * 1000
+        search_cache.set(results, *cache_key)
+        record_api_health("louvre", "ok", ms, len(results))
+        return {"results": results, "source": "louvre", "status": "ok", "count": len(results)}
+    except Exception as e:
+        ms = (time.time() - t0) * 1000
+        record_api_health("louvre", f"error: {type(e).__name__}", ms)
+        logger.warning(f"Louvre proxy error: {e}")
+        return {"results": [], "source": "louvre", "status": f"error: {type(e).__name__}"}
+
+# ── National Gallery of Art, Washington D.C. (No public search API — CSV data only on GitHub) ──
+# NGA provides open data via GitHub CSV dumps but has no REST search endpoint.
+# We use Europeana's NGA-filtered results as proxy.
+
+async def search_nga(client, query, limit=20, epoch=None, material=None):
+    if not API_KEYS.get("europeana"):
+        return {"results": [], "source": "nga", "status": "disabled", "message": "Needs Europeana key for NGA proxy search"}
+    cache_key = ("nga_proxy", query, limit, epoch, material)
+    cached = search_cache.get(*cache_key)
+    if cached is not None:
+        return {"results": cached, "source": "nga", "status": "cached"}
+    t0 = time.time()
+    try:
+        search_q = f"{query} National Gallery"
+        params = {
+            "wskey": API_KEYS["europeana"],
+            "query": search_q,
+            "rows": min(limit, 15),
+            "profile": "rich",
+            "qf": ["TYPE:IMAGE", "DATA_PROVIDER:\"National Gallery of Art\""]
+        }
+        response = await client.get("https://api.europeana.eu/record/v2/search.json", params=params, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for item in data.get("items", []):
+            img = None
+            if item.get("edmIsShownBy"):
+                img = item["edmIsShownBy"][0] if isinstance(item["edmIsShownBy"], list) else item["edmIsShownBy"]
+            elif item.get("edmPreview"):
+                img = item["edmPreview"][0] if isinstance(item["edmPreview"], list) else item["edmPreview"]
+            if not img:
+                continue
+            title = item.get("title", ["Unbekannt"])[0] if isinstance(item.get("title"), list) else item.get("title", "Unbekannt")
+            results.append({"id": f"nga_{item.get('id', '')}", "title": title,
+                "image_url": img, "source": "NGA Washington (via Europeana)",
+                "source_url": item.get("guid", ""),
+                "museum": "National Gallery of Art",
+                "epoch": "", "material": ""})
+        ms = (time.time() - t0) * 1000
+        search_cache.set(results, *cache_key)
+        record_api_health("nga", "ok", ms, len(results))
+        return {"results": results, "source": "nga", "status": "ok", "count": len(results)}
+    except Exception as e:
+        ms = (time.time() - t0) * 1000
+        record_api_health("nga", f"error: {type(e).__name__}", ms)
+        logger.warning(f"NGA proxy error: {e}")
+        return {"results": [], "source": "nga", "status": f"error: {type(e).__name__}"}
 
 def _run_all_museum_searches(client, query, limit, epoch, material):
     return [
@@ -490,19 +791,33 @@ def _run_all_museum_searches(client, query, limit, epoch, material):
         search_rijksmuseum(client, query, limit, epoch=epoch, material=material),
         search_smithsonian(client, query, limit, epoch=epoch, material=material),
         search_harvard(client, query, limit, epoch=epoch, material=material),
+        search_cleveland(client, query, limit, epoch=epoch, material=material),
+        search_chicago(client, query, limit, epoch=epoch, material=material),
+        search_cooper_hewitt(client, query, limit, epoch=epoch, material=material),
+        search_walters(client, query, limit, epoch=epoch, material=material),
+        search_yale_lux(client, query, limit, epoch=epoch, material=material),
+        search_louvre(client, query, limit, epoch=epoch, material=material),
+        search_nga(client, query, limit, epoch=epoch, material=material),
     ]
 
 @app.get("/")
 async def root():
     enabled = []
     if API_KEYS["europeana"]: enabled.append("europeana")
-    enabled.extend(["met", "victoria_albert"])
+    enabled.extend(["met", "victoria_albert", "cleveland", "chicago"])  # Always enabled (public)
     if API_KEYS["rijksmuseum"]: enabled.append("rijksmuseum")
     if API_KEYS["smithsonian"]: enabled.append("smithsonian")
     if API_KEYS["harvard"]: enabled.append("harvard")
-    return {"name": "ArchaeoFinder API", "version": "4.0.0", "status": "online",
+    if API_KEYS["cooper_hewitt"]: enabled.append("cooper_hewitt")
+    enabled.append("yale")  # Public LUX API
+    proxy_apis = []  # Use Europeana as proxy (no native search API)
+    if API_KEYS["europeana"]:
+        proxy_apis.extend(["louvre", "nga"])
+    offline = ["walters"]  # API v1 closed 2023
+    return {"name": "ArchaeoFinder API", "version": "4.3.0", "status": "online",
         "features": ["multi_museum_search", "user_auth", "save_finds", "smart_filters", "deduplication", "caching", "api_health_tracking", "live_status", "image_proxy"],
-        "enabled_apis": enabled, "total_sources": len(enabled)}
+        "enabled_apis": enabled, "proxy_apis": proxy_apis, "offline_apis": offline,
+        "total_sources": len(enabled) + len(proxy_apis)}
 
 # =============================================================================
 # API STATUS ENDPOINT — Live health checks
@@ -527,6 +842,30 @@ API_INFO = {
     "harvard": {"name": "Harvard Art Museums", "description": "Drei Museen (Fogg, Busch-Reisinger, Sackler) mit 250.000+ Objekten",
         "url": "https://harvardartmuseums.org", "api_docs": "https://harvardartmuseums.org/collections/api",
         "key_required": True, "free": True, "collections": "Antike Kunst, Archaeologie, Asiatische Kunst, Europaeische Kunst", "region": "Cambridge, USA"},
+    "cleveland": {"name": "Cleveland Museum of Art", "description": "Diverse archaeologische Artefakte und Kunstwerke, 61.000+ Open Access Objekte",
+        "url": "https://www.clevelandart.org", "api_docs": "https://openaccess-api.clevelandart.org/",
+        "key_required": False, "free": True, "collections": "Antike, Archaeologie, Asiatische Kunst, Europaeische Kunst", "region": "Cleveland, USA"},
+    "chicago": {"name": "Art Institute of Chicago", "description": "Umfassende Sammlung mit sehr guten Bilddaten, 300.000+ Objekte",
+        "url": "https://www.artic.edu", "api_docs": "https://api.artic.edu/docs/",
+        "key_required": False, "free": True, "collections": "Kunst aller Epochen, Textilien, Fotografie, Design", "region": "Chicago, USA"},
+    "cooper_hewitt": {"name": "Cooper Hewitt, Smithsonian", "description": "Smithsonian Designmuseum mit Fokus auf Designgeschichte",
+        "url": "https://www.cooperhewitt.org", "api_docs": "https://collection.cooperhewitt.org/api/",
+        "key_required": True, "free": True, "collections": "Designgeschichte, Textilien, Keramik, Grafik", "region": "New York, USA"},
+    "walters": {"name": "Walters Art Museum", "description": "Spezialisiert auf antike Kunst und Manuskripte. API v1 geschlossen 2023, wartet auf v2.",
+        "url": "https://art.thewalters.org", "api_docs": "https://github.com/WaltersArtMuseum/walters-api",
+        "key_required": False, "free": True, "collections": "Antike Kunst, Manuskripte, Aegyptische Kunst, Mittelalter", "region": "Baltimore, USA",
+        "api_status": "offline"},
+    "yale": {"name": "Yale University Art Gallery", "description": "Bedeutende numismatische und antike Bestaende via LUX Discovery, 300.000+ Objekte",
+        "url": "https://artgallery.yale.edu", "api_docs": "https://lux.collections.yale.edu/",
+        "key_required": False, "free": True, "collections": "Numismatik, Antike, Archaeologie, Asiatische Kunst", "region": "New Haven, USA"},
+    "louvre": {"name": "Musée du Louvre", "description": "500.000+ Objekte. Kein REST-Suchendpoint, Suche via Europeana-Proxy.",
+        "url": "https://collections.louvre.fr", "api_docs": "https://collections.louvre.fr/en/page/documentationJSON",
+        "key_required": False, "free": True, "collections": "Antiken, Aegypten, Orient, Skulpturen, Gemaelde", "region": "Paris, Frankreich",
+        "api_status": "proxy"},
+    "nga": {"name": "National Gallery of Art", "description": "130.000+ Objekte. Kein REST-Suchendpoint, Suche via Europeana-Proxy.",
+        "url": "https://www.nga.gov", "api_docs": "https://github.com/NationalGalleryOfArt/opendata",
+        "key_required": False, "free": True, "collections": "Bildende Kunst, Medaillen, Skulpturen, Grafik", "region": "Washington D.C., USA",
+        "api_status": "proxy"},
 }
 
 @app.get("/api/status")
@@ -580,6 +919,53 @@ async def api_status_endpoint():
             {"apikey": API_KEYS["harvard"], "q": "ancient", "size": 1},
             lambda d: d.get("info", {}).get("totalrecords", 0)))
 
+    # Public APIs — always checked
+    tasks.append(check_api("cleveland", "https://openaccess-api.clevelandart.org/api/artworks/",
+        {"q": "archaeology", "has_image": 1, "limit": 1, "indent": 0},
+        lambda d: d.get("info", {}).get("total", 0)))
+
+    tasks.append(check_api("chicago", "https://api.artic.edu/api/v1/artworks/search",
+        {"q": "ancient artifact", "limit": 1, "fields": "id,title"},
+        lambda d: d.get("pagination", {}).get("total", 0)))
+
+    if API_KEYS["cooper_hewitt"]:
+        tasks.append(check_api("cooper_hewitt", "https://api.collection.cooperhewitt.org/rest/",
+            {"method": "cooperhewitt.search.objects", "access_token": API_KEYS["cooper_hewitt"], "query": "ceramic", "per_page": 1},
+            lambda d: d.get("total", 0)))
+
+    # Walters (API v1 retired 2023)
+    async def walters_offline():
+        return "walters", {"configured": False, "status": "offline", "message": "API v1 seit 2023 eingestellt, v2 ausstehend"}
+    tasks.append(walters_offline())
+
+    # Yale LUX (public)
+    import urllib.parse as _up
+    tasks.append(check_api("yale", "https://lux.collections.yale.edu/api/search/item",
+        {"q": _up.quote(json.dumps({"AND": [{"text": "pottery"}]})), "pageLength": 1},
+        lambda d: d.get("partOf", [{}])[0].get("totalItems", 0) if d.get("partOf") else len(d.get("orderedItems", []))))
+
+    # Louvre (proxy via Europeana — no native REST search API)
+    if API_KEYS.get("europeana"):
+        tasks.append(check_api("louvre", "https://api.europeana.eu/record/v2/search.json",
+            {"wskey": API_KEYS["europeana"], "query": "Louvre antiquity", "rows": 1, "profile": "minimal",
+             "qf": "DATA_PROVIDER:\"Musée du Louvre\""},
+            lambda d: d.get("totalResults", 0)))
+    else:
+        async def louvre_no_key():
+            return "louvre", {"configured": False, "status": "not_configured", "message": "Europeana Key benötigt für Louvre-Proxy"}
+        tasks.append(louvre_no_key())
+
+    # NGA (proxy via Europeana — no native REST search API)
+    if API_KEYS.get("europeana"):
+        tasks.append(check_api("nga", "https://api.europeana.eu/record/v2/search.json",
+            {"wskey": API_KEYS["europeana"], "query": "National Gallery sculpture", "rows": 1, "profile": "minimal",
+             "qf": "DATA_PROVIDER:\"National Gallery of Art\""},
+            lambda d: d.get("totalResults", 0)))
+    else:
+        async def nga_no_key():
+            return "nga", {"configured": False, "status": "not_configured", "message": "Europeana Key benötigt für NGA-Proxy"}
+        tasks.append(nga_no_key())
+
     async def check_supabase():
         if not SUPABASE_URL or not SUPABASE_ANON_KEY:
             return "supabase", {"configured": False, "status": "not_configured"}
@@ -607,7 +993,7 @@ async def api_status_endpoint():
             info.update({"name": "Supabase", "description": "PostgreSQL Datenbank + Authentifizierung", "url": SUPABASE_URL, "region": "Frankfurt (eu-central-1)"})
         apis[key] = info
 
-    for key in ["rijksmuseum", "smithsonian", "harvard"]:
+    for key in ["rijksmuseum", "smithsonian", "harvard", "cooper_hewitt"]:
         if key not in apis and not API_KEYS.get(key):
             info = API_INFO.get(key, {}).copy()
             info.update({"configured": False, "status": "not_configured", "message": "API Key nicht gesetzt"})
@@ -616,7 +1002,7 @@ async def api_status_endpoint():
     online_count = sum(1 for v in apis.values() if v.get("status") == "online")
 
     return {
-        "version": "3.3.0",
+        "version": "4.3.0",
         "server_time": datetime.utcnow().isoformat(),
         "summary": {"online": online_count, "total": len(apis), "cache_entries": search_cache.size},
         "apis": apis,
