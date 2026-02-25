@@ -15,7 +15,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("archaeofinder")
 
-app = FastAPI(title="ArchaeoFinder API", version="4.3.0")
+app = FastAPI(title="ArchaeoFinder API", version="4.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1161,6 +1161,198 @@ async def get_profile(authorization: Optional[str] = Header(None)):
     user = await get_user_from_token(authorization)
     if not user: raise HTTPException(status_code=401, detail="Not authenticated")
     return {"user": user}
+
+# =============================================================================
+# FIBEL FINDER ENDPOINTS (Phase 3 — 768d Vector Search)
+# =============================================================================
+
+class FibelSearchRequest(BaseModel):
+    image_data: Optional[str] = None       # Base64 encoded image
+    embedding: Optional[List[float]] = None # Pre-computed 768d embedding
+    threshold: float = 0.35
+    count: int = 20
+    fibula_type: Optional[str] = None
+    epoch: Optional[str] = None
+
+# Lazy-loaded CLIP ViT-L/14 model for server-side embedding
+_clip_model = None
+_clip_preprocess = None
+_clip_tokenizer = None
+
+async def _get_clip_model():
+    """Lazy-load CLIP ViT-L/14 model. Returns None if not available (low-memory environments)."""
+    global _clip_model, _clip_preprocess, _clip_tokenizer
+    if _clip_model is not None:
+        return _clip_model, _clip_preprocess
+    try:
+        import open_clip
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, _, preprocess = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai", device=device)
+        model.eval()
+        _clip_model = model
+        _clip_preprocess = preprocess
+        logger.info(f"CLIP ViT-L/14 loaded on {device}")
+        return model, preprocess
+    except Exception as e:
+        logger.warning(f"CLIP model not available: {e}")
+        return None, None
+
+async def _create_embedding_from_image(image_data: str) -> Optional[List[float]]:
+    """Create 768d CLIP embedding from base64 image data."""
+    try:
+        model, preprocess = await _get_clip_model()
+        if model is None:
+            return None
+        import torch
+        from PIL import Image
+        import io
+        import base64
+        
+        # Decode base64
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+        img_bytes = base64.b64decode(image_data)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        
+        # Preprocess and embed
+        img_tensor = preprocess(img).unsqueeze(0)
+        device = next(model.parameters()).device
+        img_tensor = img_tensor.to(device)
+        
+        with torch.no_grad():
+            embedding = model.encode_image(img_tensor)
+            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        
+        return embedding[0].cpu().tolist()
+    except Exception as e:
+        logger.error(f"Embedding creation failed: {e}")
+        return None
+
+@app.get("/api/fibel/stats")
+async def fibel_stats():
+    """Get statistics about indexed fibulae."""
+    try:
+        client = await get_http_client()
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/fibula_stats",
+            params={"select": "*"},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
+            timeout=10.0
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if data and len(data) > 0:
+                return data[0]
+        # Table doesn't exist yet or empty
+        return {
+            "total_fibulae": 0,
+            "source_count": 0,
+            "museum_count": 0,
+            "type_count": 0,
+            "epoch_count": 0,
+            "first_indexed": None,
+            "last_indexed": None,
+            "status": "no_data",
+            "message": "Fibel-Datenbank noch nicht befüllt. Bitte GPU-Pipeline ausführen."
+        }
+    except Exception as e:
+        logger.warning(f"Fibel stats error: {e}")
+        return {
+            "total_fibulae": 0,
+            "source_count": 0,
+            "museum_count": 0,
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.post("/api/fibel/search")
+async def fibel_search(req: FibelSearchRequest):
+    """Search for similar fibulae using 768d CLIP vector similarity."""
+    embedding = None
+    
+    # Option 1: Pre-computed embedding from client
+    if req.embedding and len(req.embedding) == 768:
+        embedding = req.embedding
+    
+    # Option 2: Create embedding from image on server
+    elif req.image_data:
+        embedding = await _create_embedding_from_image(req.image_data)
+        if embedding is None:
+            raise HTTPException(
+                status_code=503,
+                detail="CLIP ViT-L/14 Modell nicht verfügbar auf diesem Server. "
+                       "Bitte Embedding client-seitig erstellen oder Backend auf GPU-fähigem Server betreiben."
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Entweder image_data oder embedding (768d) erforderlich.")
+    
+    # Query Supabase pgvector via RPC
+    try:
+        client = await get_http_client()
+        
+        rpc_body = {
+            "query_embedding": embedding,
+            "match_threshold": req.threshold,
+            "match_count": req.count
+        }
+        
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/search_fibulae",
+            json=rpc_body,
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json"
+            },
+            timeout=15.0
+        )
+        
+        if response.status_code == 200:
+            results = response.json()
+            
+            # Apply optional filters
+            if req.fibula_type:
+                results = [r for r in results if r.get("fibula_type") and req.fibula_type.lower() in r["fibula_type"].lower()]
+            if req.epoch:
+                results = [r for r in results if r.get("epoch") and req.epoch.lower() in r["epoch"].lower()]
+            
+            return {
+                "query": "vector_similarity",
+                "embedding_dimensions": 768,
+                "threshold": req.threshold,
+                "total_results": len(results),
+                "results": results
+            }
+        else:
+            error_detail = response.text
+            logger.error(f"Supabase RPC error: {response.status_code} - {error_detail}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Vektordatenbank-Fehler: {error_detail}"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fibel search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Suchfehler: {str(e)}")
+
+@app.get("/api/fibel/sources")
+async def fibel_sources():
+    """Get per-source statistics for indexed fibulae."""
+    try:
+        client = await get_http_client()
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/fibula_source_stats",
+            params={"select": "*"},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
+            timeout=10.0
+        )
+        if response.status_code == 200:
+            return {"sources": response.json()}
+        return {"sources": []}
+    except Exception as e:
+        return {"sources": [], "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
