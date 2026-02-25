@@ -15,7 +15,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("archaeofinder")
 
-app = FastAPI(title="ArchaeoFinder API", version="4.4.0")
+app = FastAPI(title="ArchaeoFinder API", version="4.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +30,7 @@ app.add_middleware(
 # =============================================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://neyudzqjqbqfaxbfnglx.supabase.co")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5leXVkenFqcWJxZmF4YmZuZ2x4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE2ODg0MTEsImV4cCI6MjA4NzI2NDQxMX0.6pVpjifV0_1ZDBCUHeLfqc3ej1GxIWSZoIppdMqkeoU")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
 API_KEYS = {
     "europeana": os.getenv("EUROPEANA_API_KEY", ""),
@@ -1174,61 +1174,6 @@ class FibelSearchRequest(BaseModel):
     fibula_type: Optional[str] = None
     epoch: Optional[str] = None
 
-# Lazy-loaded CLIP ViT-L/14 model for server-side embedding
-_clip_model = None
-_clip_preprocess = None
-_clip_tokenizer = None
-
-async def _get_clip_model():
-    """Lazy-load CLIP ViT-L/14 model. Returns None if not available (low-memory environments)."""
-    global _clip_model, _clip_preprocess, _clip_tokenizer
-    if _clip_model is not None:
-        return _clip_model, _clip_preprocess
-    try:
-        import open_clip
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, _, preprocess = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai", device=device)
-        model.eval()
-        _clip_model = model
-        _clip_preprocess = preprocess
-        logger.info(f"CLIP ViT-L/14 loaded on {device}")
-        return model, preprocess
-    except Exception as e:
-        logger.warning(f"CLIP model not available: {e}")
-        return None, None
-
-async def _create_embedding_from_image(image_data: str) -> Optional[List[float]]:
-    """Create 768d CLIP embedding from base64 image data."""
-    try:
-        model, preprocess = await _get_clip_model()
-        if model is None:
-            return None
-        import torch
-        from PIL import Image
-        import io
-        import base64
-        
-        # Decode base64
-        if "," in image_data:
-            image_data = image_data.split(",", 1)[1]
-        img_bytes = base64.b64decode(image_data)
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        
-        # Preprocess and embed
-        img_tensor = preprocess(img).unsqueeze(0)
-        device = next(model.parameters()).device
-        img_tensor = img_tensor.to(device)
-        
-        with torch.no_grad():
-            embedding = model.encode_image(img_tensor)
-            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-        
-        return embedding[0].cpu().tolist()
-    except Exception as e:
-        logger.error(f"Embedding creation failed: {e}")
-        return None
-
 @app.get("/api/fibel/stats")
 async def fibel_stats():
     """Get statistics about indexed fibulae."""
@@ -1244,7 +1189,6 @@ async def fibel_stats():
             data = response.json()
             if data and len(data) > 0:
                 return data[0]
-        # Table doesn't exist yet or empty
         return {
             "total_fibulae": 0,
             "source_count": 0,
@@ -1254,7 +1198,7 @@ async def fibel_stats():
             "first_indexed": None,
             "last_indexed": None,
             "status": "no_data",
-            "message": "Fibel-Datenbank noch nicht befüllt. Bitte GPU-Pipeline ausführen."
+            "message": "Fibel-Datenbank noch nicht befuellt. Bitte GPU-Pipeline ausfuehren."
         }
     except Exception as e:
         logger.warning(f"Fibel stats error: {e}")
@@ -1268,24 +1212,20 @@ async def fibel_stats():
 
 @app.post("/api/fibel/search")
 async def fibel_search(req: FibelSearchRequest):
-    """Search for similar fibulae using 768d CLIP vector similarity."""
-    embedding = None
+    """Search for similar fibulae using 768d CLIP vector similarity.
     
-    # Option 1: Pre-computed embedding from client
-    if req.embedding and len(req.embedding) == 768:
-        embedding = req.embedding
+    Embedding MUST be created client-side (browser CLIP ViT-L/14).
+    This endpoint only forwards the pre-computed embedding to Supabase pgvector.
+    """
+    # Validate embedding
+    if not req.embedding or len(req.embedding) != 768:
+        raise HTTPException(
+            status_code=400,
+            detail="768d Embedding erforderlich. Das Embedding wird im Browser erstellt (CLIP ViT-L/14). "
+                   f"Erhalten: {len(req.embedding) if req.embedding else 0} Dimensionen."
+        )
     
-    # Option 2: Create embedding from image on server
-    elif req.image_data:
-        embedding = await _create_embedding_from_image(req.image_data)
-        if embedding is None:
-            raise HTTPException(
-                status_code=503,
-                detail="CLIP ViT-L/14 Modell nicht verfügbar auf diesem Server. "
-                       "Bitte Embedding client-seitig erstellen oder Backend auf GPU-fähigem Server betreiben."
-            )
-    else:
-        raise HTTPException(status_code=400, detail="Entweder image_data oder embedding (768d) erforderlich.")
+    embedding = req.embedding
     
     # Query Supabase pgvector via RPC
     try:
