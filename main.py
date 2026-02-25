@@ -30,7 +30,7 @@ app.add_middleware(
 # =============================================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://neyudzqjqbqfaxbfnglx.supabase.co")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5leXVkenFqcWJxZmF4YmZuZ2x4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE2ODg0MTEsImV4cCI6MjA4NzI2NDQxMX0.6pVpjifV0_1ZDBCUHeLfqc3ej1GxIWSZoIppdMqkeoU")
 
 API_KEYS = {
     "europeana": os.getenv("EUROPEANA_API_KEY", ""),
