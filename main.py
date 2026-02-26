@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 import json
 
-app = FastAPI(title="ArchaeoFinder API", version="4.0.0")
+app = FastAPI(title="ArchaeoFinder API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +70,12 @@ class FindUpdate(BaseModel):
     is_public: Optional[bool] = None
 
 class FibelSearchRequest(BaseModel):
+    embedding: List[float]
+    match_threshold: Optional[float] = 0.3
+    match_count: Optional[int] = 30
+    source_filter: Optional[str] = None
+
+class CoinSearchRequest(BaseModel):
     embedding: List[float]
     match_threshold: Optional[float] = 0.3
     match_count: Optional[int] = 30
@@ -238,9 +244,9 @@ async def root():
         enabled.append("harvard")
     return {
         "name": "ArchaeoFinder API",
-        "version": "4.0.0",
+        "version": "5.0.0",
         "status": "online",
-        "features": ["multi_museum_search", "user_auth", "save_finds", "fibel_visual_search"],
+        "features": ["multi_museum_search", "user_auth", "save_finds", "fibel_visual_search", "coin_visual_search"],
         "enabled_apis": enabled,
         "total_sources": len(enabled),
     }
@@ -368,6 +374,111 @@ async def fibel_random(count: int = Query(12, ge=1, le=50)):
             f"{SUPABASE_URL}/rest/v1/fibula_embeddings",
             params={
                 "select": "id,source,source_id,title,image_url,thumbnail_url,source_url,museum,epoch,material,fibula_type",
+                "limit": count,
+                "order": "created_at.desc",
+            },
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            },
+            timeout=10.0,
+        )
+        if response.status_code == 200:
+            return {"results": response.json()}
+        return {"results": []}
+
+
+# =============================================================================
+# MUENZ FINDER — VISUAL SIMILARITY SEARCH (NEW v5.0)
+# =============================================================================
+
+@app.post("/api/coin/search")
+async def coin_search(request: CoinSearchRequest):
+    """
+    Visuelle Aehnlichkeitssuche fuer Muenzen: Empfaengt CLIP ViT-L/14
+    Embedding (768d), sucht in Supabase via pgvector Cosine Similarity.
+    """
+    if len(request.embedding) != 768:
+        raise HTTPException(status_code=400, detail=f"Embedding muss 768 Dimensionen haben, nicht {len(request.embedding)}")
+
+    embedding_str = "[" + ",".join(str(x) for x in request.embedding) + "]"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/search_coins",
+            json={
+                "query_embedding": embedding_str,
+                "match_threshold": request.match_threshold,
+                "match_count": request.match_count,
+            },
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            },
+            timeout=15.0,
+        )
+
+        if response.status_code != 200:
+            print(f"Supabase RPC error (coins): {response.status_code} {response.text}")
+            raise HTTPException(status_code=502, detail=f"Supabase Fehler: {response.status_code}")
+
+        results = response.json()
+
+    if request.source_filter:
+        results = [r for r in results if r.get("source") == request.source_filter]
+
+    for r in results:
+        if "similarity" in r:
+            r["similarity_pct"] = round(r["similarity"] * 100, 1)
+
+    return {
+        "total_results": len(results),
+        "results": results,
+    }
+
+
+@app.get("/api/coin/stats")
+async def coin_stats():
+    """Statistiken ueber die Muenz-Datenbank."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/coin_source_stats",
+            params={"select": "*"},
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            },
+            timeout=10.0,
+        )
+        source_stats = response.json() if response.status_code == 200 else []
+
+        resp2 = await client.get(
+            f"{SUPABASE_URL}/rest/v1/coin_stats",
+            params={"select": "*"},
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            },
+            timeout=10.0,
+        )
+        total_stats = {}
+        if resp2.status_code == 200:
+            data = resp2.json()
+            if data:
+                total_stats = data[0] if isinstance(data, list) else data
+
+    return {"total": total_stats, "sources": source_stats}
+
+
+@app.get("/api/coin/random")
+async def coin_random(count: int = Query(12, ge=1, le=50)):
+    """Zufaellige Muenzen aus der Datenbank."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/coin_embeddings",
+            params={
+                "select": "id,source,source_id,title,image_url,thumbnail_url,source_url,museum,epoch,material,coin_type",
                 "limit": count,
                 "order": "created_at.desc",
             },
