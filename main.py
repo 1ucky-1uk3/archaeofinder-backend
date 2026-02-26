@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, Header, HTTPException, Depends
+from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -7,8 +7,9 @@ import asyncio
 import os
 from datetime import datetime
 import json
+import math
 
-app = FastAPI(title="ArchaeoFinder API", version="5.0.0")
+app = FastAPI(title="ArchaeoFinder API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,17 +70,15 @@ class FindUpdate(BaseModel):
     notes: Optional[str] = None
     is_public: Optional[bool] = None
 
-class FibelSearchRequest(BaseModel):
-    embedding: List[float]
-    match_threshold: Optional[float] = 0.3
-    match_count: Optional[int] = 30
-    source_filter: Optional[str] = None
-
-class CoinSearchRequest(BaseModel):
-    embedding: List[float]
-    match_threshold: Optional[float] = 0.3
-    match_count: Optional[int] = 30
-    source_filter: Optional[str] = None
+class VisualSearchRequest(BaseModel):
+    """Request fuer visuelle Aehnlichkeitssuche (Fibelfinder/Muenzfinder)"""
+    embedding: List[float]                   # CLIP Embedding vom Browser (512 oder 768 dim)
+    finder_type: str = "fibel"               # "fibel", "muenze", "all"
+    epoch: Optional[str] = None              # z.B. "Roemisch", "Mittelalter"
+    material: Optional[str] = None           # z.B. "Bronze", "Silber"
+    museum: Optional[str] = None             # Museum-Filter
+    limit: int = 20                          # Max Ergebnisse (1-100)
+    min_similarity: float = 0.5              # Min Cosine Similarity (0.0-1.0)
 
 # =============================================================================
 # AUTH HELPER
@@ -93,8 +92,11 @@ async def get_user_from_token(authorization: Optional[str] = Header(None)):
         try:
             response = await client.get(
                 f"{SUPABASE_URL}/auth/v1/user",
-                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
-                timeout=10.0,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY
+                },
+                timeout=10.0
             )
             if response.status_code == 200:
                 return response.json()
@@ -109,15 +111,38 @@ async def require_auth(authorization: Optional[str] = Header(None)):
     return user
 
 # =============================================================================
-# MUSEUM API FUNCTIONS (existing)
+# COSINE SIMILARITY (Python Fallback)
 # =============================================================================
 
-async def search_europeana(client, query, limit=20):
+def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    if len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+# =============================================================================
+# MUSEUM API FUNCTIONS (Kategorie-Suche)
+# =============================================================================
+
+async def search_europeana(client: httpx.AsyncClient, query: str, limit: int = 20):
     if not API_KEYS["europeana"]:
         return []
     try:
-        params = {"wskey": API_KEYS["europeana"], "query": query, "rows": limit, "profile": "rich", "qf": "TYPE:IMAGE"}
-        response = await client.get("https://api.europeana.eu/record/v2/search.json", params=params, timeout=10.0)
+        params = {
+            "wskey": API_KEYS["europeana"],
+            "query": query,
+            "rows": limit,
+            "profile": "rich",
+            "qf": "TYPE:IMAGE"
+        }
+        response = await client.get(
+            "https://api.europeana.eu/record/v2/search.json",
+            params=params, timeout=10.0
+        )
         response.raise_for_status()
         data = response.json()
         results = []
@@ -140,19 +165,35 @@ async def search_europeana(client, query, limit=20):
         print(f"Europeana error: {e}")
         return []
 
-async def search_met(client, query, limit=20):
+async def search_met(client: httpx.AsyncClient, query: str, limit: int = 20):
     try:
-        resp = await client.get("https://collectionapi.metmuseum.org/public/collection/v1/search", params={"q": query, "hasImages": "true"}, timeout=10.0)
-        resp.raise_for_status()
-        ids = resp.json().get("objectIDs", [])[:limit]
-        if not ids:
+        search_response = await client.get(
+            "https://collectionapi.metmuseum.org/public/collection/v1/search",
+            params={"q": query, "hasImages": "true"}, timeout=10.0
+        )
+        search_response.raise_for_status()
+        search_data = search_response.json()
+        object_ids = search_data.get("objectIDs", [])[:limit]
+        if not object_ids:
             return []
         results = []
-        for oid in ids[:8]:
+        for obj_id in object_ids[:8]:
             try:
-                obj = (await client.get(f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{oid}", timeout=5.0)).json()
+                obj_response = await client.get(
+                    f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{obj_id}",
+                    timeout=5.0
+                )
+                obj = obj_response.json()
                 if obj.get("primaryImage"):
-                    results.append({"id": f"met_{oid}", "title": obj.get("title", "Unbekannt"), "image_url": obj.get("primaryImageSmall") or obj.get("primaryImage"), "source": "Met Museum", "source_url": obj.get("objectURL", ""), "museum": "Metropolitan Museum of Art", "epoch": obj.get("objectDate", "")})
+                    results.append({
+                        "id": f"met_{obj_id}",
+                        "title": obj.get("title", "Unbekannt"),
+                        "image_url": obj.get("primaryImageSmall") or obj.get("primaryImage"),
+                        "source": "Met Museum",
+                        "source_url": obj.get("objectURL", ""),
+                        "museum": "Metropolitan Museum of Art",
+                        "epoch": obj.get("objectDate", ""),
+                    })
             except:
                 continue
         return results
@@ -160,341 +201,353 @@ async def search_met(client, query, limit=20):
         print(f"Met error: {e}")
         return []
 
-async def search_va(client, query, limit=20):
+async def search_va(client: httpx.AsyncClient, query: str, limit: int = 20):
     try:
-        resp = await client.get("https://api.vam.ac.uk/v2/objects/search", params={"q": query, "page_size": limit, "images_exist": 1}, timeout=10.0)
-        resp.raise_for_status()
+        response = await client.get(
+            "https://api.vam.ac.uk/v2/objects/search",
+            params={"q": query, "page_size": limit, "images_exist": 1},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        data = response.json()
         results = []
-        for item in resp.json().get("records", []):
+        for item in data.get("records", []):
             img = item.get("_images", {}).get("_primary_thumbnail")
             if img:
-                results.append({"id": f"va_{item.get('systemNumber', '')}", "title": item.get("_primaryTitle", "Unbekannt"), "image_url": img, "source": "V&A Museum", "source_url": f"https://collections.vam.ac.uk/item/{item.get('systemNumber', '')}", "museum": "Victoria & Albert Museum", "epoch": item.get("_primaryDate", "")})
+                results.append({
+                    "id": f"va_{item.get('systemNumber', '')}",
+                    "title": item.get("_primaryTitle", "Unbekannt"),
+                    "image_url": img,
+                    "source": "V&A Museum",
+                    "source_url": f"https://collections.vam.ac.uk/item/{item.get('systemNumber', '')}",
+                    "museum": "Victoria & Albert Museum",
+                    "epoch": item.get("_primaryDate", ""),
+                })
         return results
     except Exception as e:
         print(f"V&A error: {e}")
         return []
 
-async def search_rijksmuseum(client, query, limit=20):
+async def search_rijksmuseum(client: httpx.AsyncClient, query: str, limit: int = 20):
     if not API_KEYS["rijksmuseum"]:
         return []
     try:
-        resp = await client.get("https://www.rijksmuseum.nl/api/en/collection", params={"key": API_KEYS["rijksmuseum"], "q": query, "ps": limit, "imgonly": "true", "format": "json"}, timeout=10.0)
-        resp.raise_for_status()
+        response = await client.get(
+            "https://www.rijksmuseum.nl/api/en/collection",
+            params={"key": API_KEYS["rijksmuseum"], "q": query, "ps": limit, "imgonly": "true", "format": "json"},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        data = response.json()
         results = []
-        for item in resp.json().get("artObjects", []):
+        for item in data.get("artObjects", []):
             if item.get("webImage", {}).get("url"):
-                results.append({"id": item.get("objectNumber", ""), "title": item.get("title", "Unbekannt"), "image_url": item.get("webImage", {}).get("url", ""), "source": "Rijksmuseum", "source_url": item.get("links", {}).get("web", ""), "museum": "Rijksmuseum Amsterdam"})
+                results.append({
+                    "id": item.get("objectNumber", ""),
+                    "title": item.get("title", "Unbekannt"),
+                    "image_url": item["webImage"]["url"],
+                    "source": "Rijksmuseum",
+                    "source_url": item.get("links", {}).get("web", ""),
+                    "museum": "Rijksmuseum Amsterdam",
+                })
         return results
     except Exception as e:
         print(f"Rijksmuseum error: {e}")
         return []
 
-async def search_smithsonian(client, query, limit=20):
+async def search_smithsonian(client: httpx.AsyncClient, query: str, limit: int = 20):
     if not API_KEYS["smithsonian"]:
         return []
     try:
-        resp = await client.get("https://api.si.edu/openaccess/api/v1.0/search", params={"api_key": API_KEYS["smithsonian"], "q": query + " AND online_media_type:Images", "rows": limit}, timeout=10.0)
-        resp.raise_for_status()
+        response = await client.get(
+            "https://api.si.edu/openaccess/api/v1.0/search",
+            params={"api_key": API_KEYS["smithsonian"], "q": query + " AND online_media_type:Images", "rows": limit},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        data = response.json()
         results = []
-        for row in resp.json().get("response", {}).get("rows", []):
+        for row in data.get("response", {}).get("rows", []):
             content = row.get("content", {})
             desc = content.get("descriptiveNonRepeating", {})
             img = None
-            if content.get("online_media", {}).get("media"):
-                media = content["online_media"]["media"]
-                if media:
-                    img = media[0].get("content", "")
+            media_list = content.get("online_media", {}).get("media", [])
+            if media_list:
+                img = media_list[0].get("content", "")
             if img:
-                results.append({"id": row.get("id", ""), "title": desc.get("title", {}).get("content", "Unbekannt"), "image_url": img, "source": "Smithsonian", "source_url": desc.get("record_link", ""), "museum": desc.get("unit_name", "Smithsonian")})
+                results.append({
+                    "id": row.get("id", ""),
+                    "title": desc.get("title", {}).get("content", "Unbekannt"),
+                    "image_url": img,
+                    "source": "Smithsonian",
+                    "source_url": desc.get("record_link", ""),
+                    "museum": desc.get("unit_name", "Smithsonian"),
+                })
         return results
     except Exception as e:
         print(f"Smithsonian error: {e}")
         return []
 
-async def search_harvard(client, query, limit=20):
+async def search_harvard(client: httpx.AsyncClient, query: str, limit: int = 20):
     if not API_KEYS["harvard"]:
         return []
     try:
-        resp = await client.get("https://api.harvardartmuseums.org/object", params={"apikey": API_KEYS["harvard"], "q": query, "size": limit, "hasimage": 1}, timeout=10.0)
-        resp.raise_for_status()
+        response = await client.get(
+            "https://api.harvardartmuseums.org/object",
+            params={"apikey": API_KEYS["harvard"], "q": query, "size": limit, "hasimage": 1},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        data = response.json()
         results = []
-        for item in resp.json().get("records", []):
+        for item in data.get("records", []):
             if item.get("primaryimageurl"):
-                results.append({"id": f"harvard_{item.get('id', '')}", "title": item.get("title", "Unbekannt"), "image_url": item.get("primaryimageurl", ""), "source": "Harvard Museums", "source_url": item.get("url", ""), "museum": "Harvard Art Museums", "epoch": item.get("dated", "")})
+                results.append({
+                    "id": f"harvard_{item.get('id', '')}",
+                    "title": item.get("title", "Unbekannt"),
+                    "image_url": item["primaryimageurl"],
+                    "source": "Harvard Museums",
+                    "source_url": item.get("url", ""),
+                    "museum": "Harvard Art Museums",
+                    "epoch": item.get("dated", ""),
+                })
         return results
     except Exception as e:
         print(f"Harvard error: {e}")
         return []
 
 # =============================================================================
-# API ENDPOINTS — GENERAL
+# ENDPOINTS - Status
 # =============================================================================
 
 @app.get("/")
 async def root():
     enabled = []
-    if API_KEYS["europeana"]:
-        enabled.append("europeana")
+    if API_KEYS["europeana"]: enabled.append("europeana")
     enabled.extend(["met", "victoria_albert"])
-    if API_KEYS["rijksmuseum"]:
-        enabled.append("rijksmuseum")
-    if API_KEYS["smithsonian"]:
-        enabled.append("smithsonian")
-    if API_KEYS["harvard"]:
-        enabled.append("harvard")
+    if API_KEYS["rijksmuseum"]: enabled.append("rijksmuseum")
+    if API_KEYS["smithsonian"]: enabled.append("smithsonian")
+    if API_KEYS["harvard"]: enabled.append("harvard")
     return {
         "name": "ArchaeoFinder API",
-        "version": "5.0.0",
+        "version": "4.0.0",
         "status": "online",
-        "features": ["multi_museum_search", "user_auth", "save_finds", "fibel_visual_search", "coin_visual_search"],
+        "features": ["multi_museum_search", "visual_similarity_search", "fibel_finder", "muenz_finder", "user_auth", "save_finds"],
         "enabled_apis": enabled,
-        "total_sources": len(enabled),
+        "total_sources": len(enabled)
     }
 
+# =============================================================================
+# ENDPOINTS - Kategorie-Suche (bestehend, erweitert um Epoch-Filter)
+# =============================================================================
+
 @app.get("/api/search")
-async def search(q: str = Query(...), limit: int = Query(20, ge=1, le=50)):
+async def search(
+    q: str = Query(..., description="Search query"),
+    limit: int = Query(20, ge=1, le=100),
+    epoch: Optional[str] = Query(None, description="Epoch filter"),
+):
     async with httpx.AsyncClient() as client:
+        search_q = f"{q} {epoch}" if epoch and epoch != "all" else q
         tasks = [
-            search_europeana(client, q, limit),
-            search_met(client, q, limit),
-            search_va(client, q, limit),
-            search_rijksmuseum(client, q, limit),
-            search_smithsonian(client, q, limit),
-            search_harvard(client, q, limit),
+            search_europeana(client, search_q, limit),
+            search_met(client, search_q, limit),
+            search_va(client, search_q, limit),
+            search_rijksmuseum(client, search_q, limit),
+            search_smithsonian(client, search_q, limit),
+            search_harvard(client, search_q, limit),
         ]
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
     combined = []
-    for r in all_results:
-        if isinstance(r, list):
-            combined.extend(r)
+    for results in all_results:
+        if isinstance(results, list):
+            combined.extend(results)
     combined = [r for r in combined if r.get("image_url")]
-    return {"query": q, "total_results": len(combined), "results": combined}
-
-# =============================================================================
-# FIBEL FINDER — VISUAL SIMILARITY SEARCH (NEW v4.0)
-# =============================================================================
-
-@app.post("/api/fibel/search")
-async def fibel_search(request: FibelSearchRequest):
-    """
-    Visuelle Aehnlichkeitssuche: Empfaengt CLIP ViT-L/14 Embedding (768d),
-    sucht in Supabase via pgvector Cosine Similarity.
-    """
-    if len(request.embedding) != 768:
-        raise HTTPException(status_code=400, detail=f"Embedding muss 768 Dimensionen haben, nicht {len(request.embedding)}")
-
-    # Embedding als Postgres-Array formatieren
-    embedding_str = "[" + ",".join(str(x) for x in request.embedding) + "]"
-
-    async with httpx.AsyncClient() as client:
-        # Supabase RPC: search_fibulae(query_embedding, match_threshold, match_count)
-        response = await client.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/search_fibulae",
-            json={
-                "query_embedding": embedding_str,
-                "match_threshold": request.match_threshold,
-                "match_count": request.match_count,
-            },
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=15.0,
-        )
-
-        if response.status_code != 200:
-            print(f"Supabase RPC error: {response.status_code} {response.text}")
-            raise HTTPException(status_code=502, detail=f"Supabase Fehler: {response.status_code}")
-
-        results = response.json()
-
-    # Optional: Source-Filter
-    if request.source_filter:
-        results = [r for r in results if r.get("source") == request.source_filter]
-
-    # Similarity als Prozent formatieren
-    for r in results:
-        if "similarity" in r:
-            r["similarity_pct"] = round(r["similarity"] * 100, 1)
-
     return {
+        "query": q,
+        "epoch_filter": epoch,
+        "total_results": len(combined),
+        "results": combined[:limit]
+    }
+
+# =============================================================================
+# ENDPOINTS - Visual Similarity Search (Fibelfinder / Muenzfinder)
+# =============================================================================
+
+@app.post("/api/visual-search")
+async def visual_search(req: VisualSearchRequest):
+    """
+    Visuelle Aehnlichkeitssuche.
+    Empfaengt CLIP-Embedding vom Frontend, sucht aehnliche Artefakte in DB.
+    Strategie: pgvector RPC (schnell) -> Python Fallback (langsam)
+    """
+    if not req.embedding or len(req.embedding) < 10:
+        raise HTTPException(status_code=400, detail="Invalid embedding vector")
+    req.limit = max(1, min(100, req.limit))
+    req.min_similarity = max(0.0, min(1.0, req.min_similarity))
+    
+    try:
+        results = await _visual_search_pgvector(req)
+    except Exception as e:
+        print(f"pgvector search failed, using fallback: {e}")
+        results = await _visual_search_fallback(req)
+    
+    return {
+        "finder_type": req.finder_type,
+        "epoch_filter": req.epoch,
+        "min_similarity": req.min_similarity,
         "total_results": len(results),
-        "results": results,
+        "results": results
     }
 
 
-@app.get("/api/fibel/stats")
-async def fibel_stats():
-    """Statistiken ueber die Fibel-Datenbank."""
-    async with httpx.AsyncClient() as client:
-        # Quellen-Statistik
-        response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/fibula_source_stats",
-            params={"select": "*"},
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=10.0,
-        )
-
-        source_stats = []
-        if response.status_code == 200:
-            source_stats = response.json()
-
-        # Gesamt-Statistik
-        resp2 = await client.get(
-            f"{SUPABASE_URL}/rest/v1/fibula_stats",
-            params={"select": "*"},
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=10.0,
-        )
-
-        total_stats = {}
-        if resp2.status_code == 200:
-            data = resp2.json()
-            if data:
-                total_stats = data[0] if isinstance(data, list) else data
-
-    return {
-        "total": total_stats,
-        "sources": source_stats,
+async def _visual_search_pgvector(req: VisualSearchRequest) -> list:
+    """Suche via Supabase pgvector RPC (match_artifacts Funktion)."""
+    rpc_params = {
+        "query_embedding": req.embedding,
+        "match_threshold": req.min_similarity,
+        "match_count": req.limit,
+        "filter_type": req.finder_type if req.finder_type != "all" else None,
+        "filter_epoch": req.epoch if req.epoch and req.epoch != "all" else None,
+        "filter_material": req.material if req.material and req.material != "all" else None,
+        "filter_museum": req.museum if req.museum and req.museum != "all" else None,
     }
-
-
-@app.get("/api/fibel/random")
-async def fibel_random(count: int = Query(12, ge=1, le=50)):
-    """Zufaellige Fibeln aus der Datenbank (fuer Startseite)."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/fibula_embeddings",
-            params={
-                "select": "id,source,source_id,title,image_url,thumbnail_url,source_url,museum,epoch,material,fibula_type",
-                "limit": count,
-                "order": "created_at.desc",
-            },
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=10.0,
-        )
-        if response.status_code == 200:
-            return {"results": response.json()}
-        return {"results": []}
-
-
-# =============================================================================
-# MUENZ FINDER — VISUAL SIMILARITY SEARCH (NEW v5.0)
-# =============================================================================
-
-@app.post("/api/coin/search")
-async def coin_search(request: CoinSearchRequest):
-    """
-    Visuelle Aehnlichkeitssuche fuer Muenzen: Empfaengt CLIP ViT-L/14
-    Embedding (768d), sucht in Supabase via pgvector Cosine Similarity.
-    """
-    if len(request.embedding) != 768:
-        raise HTTPException(status_code=400, detail=f"Embedding muss 768 Dimensionen haben, nicht {len(request.embedding)}")
-
-    embedding_str = "[" + ",".join(str(x) for x in request.embedding) + "]"
-
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/search_coins",
-            json={
-                "query_embedding": embedding_str,
-                "match_threshold": request.match_threshold,
-                "match_count": request.match_count,
-            },
+            f"{SUPABASE_URL}/rest/v1/rpc/match_artifacts",
+            json=rpc_params,
             headers={
                 "apikey": SUPABASE_ANON_KEY,
-                "Content-Type": "application/json",
                 "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json"
             },
-            timeout=15.0,
+            timeout=15.0
         )
-
         if response.status_code != 200:
-            print(f"Supabase RPC error (coins): {response.status_code} {response.text}")
-            raise HTTPException(status_code=502, detail=f"Supabase Fehler: {response.status_code}")
+            raise Exception(f"RPC failed: {response.status_code} - {response.text}")
+        data = response.json()
+    
+    return [{
+        "id": item.get("id", ""),
+        "title": item.get("title", "Unbekannt"),
+        "image_url": item.get("image_url", ""),
+        "source": item.get("museum", ""),
+        "source_url": item.get("source_url", ""),
+        "museum": item.get("museum", ""),
+        "epoch": item.get("epoch", ""),
+        "material": item.get("material", ""),
+        "object_type": item.get("object_type", ""),
+        "similarity": round(item.get("similarity", 0), 4),
+    } for item in data]
 
-        results = response.json()
 
-    if request.source_filter:
-        results = [r for r in results if r.get("source") == request.source_filter]
-
-    for r in results:
-        if "similarity" in r:
-            r["similarity_pct"] = round(r["similarity"] * 100, 1)
-
-    return {
-        "total_results": len(results),
-        "results": results,
+async def _visual_search_fallback(req: VisualSearchRequest) -> list:
+    """Fallback: Embeddings laden, Cosine-Similarity in Python berechnen."""
+    params = {
+        "select": "id,title,image_url,source_url,museum,epoch,material,object_type,embedding",
+        "order": "created_at.desc",
+        "limit": 500
     }
-
-
-@app.get("/api/coin/stats")
-async def coin_stats():
-    """Statistiken ueber die Muenz-Datenbank."""
+    if req.finder_type and req.finder_type != "all":
+        params["object_type"] = f"eq.{req.finder_type}"
+    if req.epoch and req.epoch != "all":
+        params["epoch"] = f"eq.{req.epoch}"
+    if req.material and req.material != "all":
+        params["material"] = f"eq.{req.material}"
+    if req.museum and req.museum != "all":
+        params["museum"] = f"eq.{req.museum}"
+    
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/coin_source_stats",
-            params={"select": "*"},
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=10.0,
+            f"{SUPABASE_URL}/rest/v1/artifact_embeddings",
+            params=params,
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
+            timeout=15.0
         )
-        source_stats = response.json() if response.status_code == 200 else []
-
-        resp2 = await client.get(
-            f"{SUPABASE_URL}/rest/v1/coin_stats",
-            params={"select": "*"},
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=10.0,
-        )
-        total_stats = {}
-        if resp2.status_code == 200:
-            data = resp2.json()
-            if data:
-                total_stats = data[0] if isinstance(data, list) else data
-
-    return {"total": total_stats, "sources": source_stats}
-
-
-@app.get("/api/coin/random")
-async def coin_random(count: int = Query(12, ge=1, le=50)):
-    """Zufaellige Muenzen aus der Datenbank."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/coin_embeddings",
-            params={
-                "select": "id,source,source_id,title,image_url,thumbnail_url,source_url,museum,epoch,material,coin_type",
-                "limit": count,
-                "order": "created_at.desc",
-            },
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
-            timeout=10.0,
-        )
-        if response.status_code == 200:
-            return {"results": response.json()}
-        return {"results": []}
-
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to query embeddings")
+        items = response.json()
+    
+    scored = []
+    for item in items:
+        emb = item.get("embedding")
+        if not emb:
+            continue
+        if isinstance(emb, str):
+            try:
+                emb = json.loads(emb)
+            except:
+                continue
+        sim = cosine_similarity(req.embedding, emb)
+        if sim >= req.min_similarity:
+            scored.append({
+                "id": item.get("id", ""),
+                "title": item.get("title", "Unbekannt"),
+                "image_url": item.get("image_url", ""),
+                "source": item.get("museum", ""),
+                "source_url": item.get("source_url", ""),
+                "museum": item.get("museum", ""),
+                "epoch": item.get("epoch", ""),
+                "material": item.get("material", ""),
+                "object_type": item.get("object_type", ""),
+                "similarity": round(sim, 4),
+            })
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:req.limit]
 
 # =============================================================================
-# USER FINDS ENDPOINTS (existing)
+# ENDPOINTS - Visual Search Stats & Filter-Optionen
+# =============================================================================
+
+@app.get("/api/visual-search/stats")
+async def visual_search_stats():
+    """Statistiken: Anzahl Embeddings pro Typ."""
+    stats = {"total": 0, "fibel": 0, "muenze": 0}
+    async with httpx.AsyncClient() as client:
+        for key in ["total", "fibel", "muenze"]:
+            try:
+                p = {"select": "id", "limit": 1}
+                if key != "total":
+                    p["object_type"] = f"eq.{key}"
+                response = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/artifact_embeddings",
+                    params=p,
+                    headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}", "Prefer": "count=exact"},
+                    timeout=10.0
+                )
+                total = response.headers.get("content-range", "")
+                if "/" in total:
+                    stats[key] = int(total.split("/")[1])
+            except:
+                pass
+    return stats
+
+@app.get("/api/visual-search/filters")
+async def visual_search_filters():
+    """Verfuegbare Filter-Optionen aus der Datenbank."""
+    filters = {"epochs": [], "materials": [], "museums": [], "object_types": []}
+    async with httpx.AsyncClient() as client:
+        for field in ["epoch", "material", "museum", "object_type"]:
+            try:
+                response = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/artifact_embeddings",
+                    params={"select": field, "order": f"{field}.asc", "limit": 500},
+                    headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    unique_vals = sorted(set(item.get(field, "") for item in data if item.get(field)))
+                    key = field + "s" if not field.endswith("s") else field
+                    if field == "object_type":
+                        key = "object_types"
+                    filters[key] = unique_vals
+            except:
+                pass
+    return filters
+
+# =============================================================================
+# USER FINDS ENDPOINTS (bestehend)
 # =============================================================================
 
 @app.get("/api/finds")
@@ -507,11 +560,12 @@ async def get_user_finds(authorization: Optional[str] = Header(None)):
             f"{SUPABASE_URL}/rest/v1/finds",
             params={"user_id": f"eq.{user['id']}", "order": "created_at.desc"},
             headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY},
-            timeout=10.0,
+            timeout=10.0
         )
         if response.status_code == 200:
             return {"finds": response.json()}
-        raise HTTPException(status_code=response.status_code, detail="Failed to fetch finds")
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch finds")
 
 @app.post("/api/finds")
 async def create_find(find: FindCreate, authorization: Optional[str] = Header(None)):
@@ -533,11 +587,12 @@ async def create_find(find: FindCreate, authorization: Optional[str] = Header(No
             f"{SUPABASE_URL}/rest/v1/finds",
             json=find_data,
             headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Prefer": "return=representation"},
-            timeout=10.0,
+            timeout=10.0
         )
         if response.status_code == 201:
             return {"success": True, "find": response.json()[0] if response.json() else None}
-        raise HTTPException(status_code=response.status_code, detail=f"Failed to create find: {response.text}")
+        else:
+            raise HTTPException(status_code=response.status_code, detail=f"Failed to create find: {response.text}")
 
 @app.put("/api/finds/{find_id}")
 async def update_find(find_id: str, find: FindUpdate, authorization: Optional[str] = Header(None)):
@@ -558,11 +613,12 @@ async def update_find(find_id: str, find: FindUpdate, authorization: Optional[st
             params={"id": f"eq.{find_id}", "user_id": f"eq.{user['id']}"},
             json=update_data,
             headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Prefer": "return=representation"},
-            timeout=10.0,
+            timeout=10.0
         )
         if response.status_code == 200:
             return {"success": True, "find": response.json()[0] if response.json() else None}
-        raise HTTPException(status_code=response.status_code, detail="Failed to update find")
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to update find")
 
 @app.delete("/api/finds/{find_id}")
 async def delete_find(find_id: str, authorization: Optional[str] = Header(None)):
@@ -574,11 +630,12 @@ async def delete_find(find_id: str, authorization: Optional[str] = Header(None))
             f"{SUPABASE_URL}/rest/v1/finds",
             params={"id": f"eq.{find_id}", "user_id": f"eq.{user['id']}"},
             headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY},
-            timeout=10.0,
+            timeout=10.0
         )
         if response.status_code == 204:
             return {"success": True}
-        raise HTTPException(status_code=response.status_code, detail="Failed to delete find")
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to delete find")
 
 @app.get("/api/profile")
 async def get_profile(authorization: Optional[str] = Header(None)):
