@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, Header, HTTPException
+from fastapi import FastAPI, Query, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 import json
 
-app = FastAPI(title="ArchaeoFinder API", version="5.0.0")
+app = FastAPI(title="ArchaeoFinder API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +81,12 @@ class CoinSearchRequest(BaseModel):
     match_count: int = 20
     source_filter: Optional[str] = None
 
+class ArtifactSearchRequest(BaseModel):
+    embedding: List[float]
+    match_threshold: float = 0.5
+    match_count: int = 20
+    source_filter: Optional[str] = None
+
 # =============================================================================
 # AUTH HELPER
 # =============================================================================
@@ -88,12 +94,17 @@ class CoinSearchRequest(BaseModel):
 async def get_user_from_token(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         return None
+    
     token = authorization.replace("Bearer ", "")
+    
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
                 f"{SUPABASE_URL}/auth/v1/user",
-                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY
+                },
                 timeout=10.0
             )
             if response.status_code == 200:
@@ -102,18 +113,35 @@ async def get_user_from_token(authorization: Optional[str] = Header(None)):
             pass
     return None
 
+async def require_auth(authorization: Optional[str] = Header(None)):
+    user = await get_user_from_token(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
 # =============================================================================
-# MUSEUM API FUNCTIONS (unveraendert)
+# MUSEUM API FUNCTIONS
 # =============================================================================
 
 async def search_europeana(client: httpx.AsyncClient, query: str, limit: int = 20):
     if not API_KEYS["europeana"]:
         return []
     try:
-        params = {"wskey": API_KEYS["europeana"], "query": query, "rows": limit, "profile": "rich", "qf": "TYPE:IMAGE"}
-        response = await client.get("https://api.europeana.eu/record/v2/search.json", params=params, timeout=10.0)
+        params = {
+            "wskey": API_KEYS["europeana"],
+            "query": query,
+            "rows": limit,
+            "profile": "rich",
+            "qf": "TYPE:IMAGE"
+        }
+        response = await client.get(
+            "https://api.europeana.eu/record/v2/search.json",
+            params=params,
+            timeout=10.0
+        )
         response.raise_for_status()
         data = response.json()
+        
         results = []
         for item in data.get("items", []):
             img = None
@@ -121,6 +149,7 @@ async def search_europeana(client: httpx.AsyncClient, query: str, limit: int = 2
                 img = item["edmIsShownBy"][0] if isinstance(item["edmIsShownBy"], list) else item["edmIsShownBy"]
             elif item.get("edmPreview"):
                 img = item["edmPreview"][0] if isinstance(item["edmPreview"], list) else item["edmPreview"]
+            
             results.append({
                 "id": item.get("id", ""),
                 "title": item.get("title", ["Unbekannt"])[0] if isinstance(item.get("title"), list) else item.get("title", "Unbekannt"),
@@ -136,16 +165,27 @@ async def search_europeana(client: httpx.AsyncClient, query: str, limit: int = 2
 
 async def search_met(client: httpx.AsyncClient, query: str, limit: int = 20):
     try:
-        search_response = await client.get("https://collectionapi.metmuseum.org/public/collection/v1/search", params={"q": query, "hasImages": "true"}, timeout=10.0)
+        search_response = await client.get(
+            "https://collectionapi.metmuseum.org/public/collection/v1/search",
+            params={"q": query, "hasImages": "true"},
+            timeout=10.0
+        )
         search_response.raise_for_status()
-        object_ids = search_response.json().get("objectIDs", [])[:limit]
+        search_data = search_response.json()
+        
+        object_ids = search_data.get("objectIDs", [])[:limit]
         if not object_ids:
             return []
+        
         results = []
         for obj_id in object_ids[:8]:
             try:
-                obj_response = await client.get(f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{obj_id}", timeout=5.0)
+                obj_response = await client.get(
+                    f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{obj_id}",
+                    timeout=5.0
+                )
                 obj = obj_response.json()
+                
                 if obj.get("primaryImage"):
                     results.append({
                         "id": f"met_{obj_id}",
@@ -165,11 +205,25 @@ async def search_met(client: httpx.AsyncClient, query: str, limit: int = 20):
 
 async def search_va(client: httpx.AsyncClient, query: str, limit: int = 20):
     try:
-        response = await client.get("https://api.vam.ac.uk/v2/objects/search", params={"q": query, "page_size": limit, "images_exist": 1}, timeout=10.0)
+        params = {
+            "q": query,
+            "page_size": limit,
+            "images_exist": 1
+        }
+        response = await client.get(
+            "https://api.vam.ac.uk/v2/objects/search",
+            params=params,
+            timeout=10.0
+        )
         response.raise_for_status()
+        data = response.json()
+        
         results = []
-        for item in response.json().get("records", []):
-            img = item.get("_images", {}).get("_primary_thumbnail")
+        for item in data.get("records", []):
+            img = None
+            if item.get("_images", {}).get("_primary_thumbnail"):
+                img = item["_images"]["_primary_thumbnail"]
+            
             if img:
                 results.append({
                     "id": f"va_{item.get('systemNumber', '')}",
@@ -189,11 +243,23 @@ async def search_rijksmuseum(client: httpx.AsyncClient, query: str, limit: int =
     if not API_KEYS["rijksmuseum"]:
         return []
     try:
-        params = {"key": API_KEYS["rijksmuseum"], "q": query, "ps": limit, "imgonly": "true", "format": "json"}
-        response = await client.get("https://www.rijksmuseum.nl/api/en/collection", params=params, timeout=10.0)
+        params = {
+            "key": API_KEYS["rijksmuseum"],
+            "q": query,
+            "ps": limit,
+            "imgonly": "true",
+            "format": "json"
+        }
+        response = await client.get(
+            "https://www.rijksmuseum.nl/api/en/collection",
+            params=params,
+            timeout=10.0
+        )
         response.raise_for_status()
+        data = response.json()
+        
         results = []
-        for item in response.json().get("artObjects", []):
+        for item in data.get("artObjects", []):
             if item.get("webImage", {}).get("url"):
                 results.append({
                     "id": item.get("objectNumber", ""),
@@ -212,18 +278,30 @@ async def search_smithsonian(client: httpx.AsyncClient, query: str, limit: int =
     if not API_KEYS["smithsonian"]:
         return []
     try:
-        params = {"api_key": API_KEYS["smithsonian"], "q": query + " AND online_media_type:Images", "rows": limit}
-        response = await client.get("https://api.si.edu/openaccess/api/v1.0/search", params=params, timeout=10.0)
+        params = {
+            "api_key": API_KEYS["smithsonian"],
+            "q": query + " AND online_media_type:Images",
+            "rows": limit
+        }
+        response = await client.get(
+            "https://api.si.edu/openaccess/api/v1.0/search",
+            params=params,
+            timeout=10.0
+        )
         response.raise_for_status()
+        data = response.json()
+        
         results = []
-        for row in response.json().get("response", {}).get("rows", []):
+        for row in data.get("response", {}).get("rows", []):
             content = row.get("content", {})
             desc = content.get("descriptiveNonRepeating", {})
+            
             img = None
             if content.get("online_media", {}).get("media"):
                 media = content["online_media"]["media"]
                 if media and len(media) > 0:
                     img = media[0].get("content", "")
+            
             if img:
                 results.append({
                     "id": row.get("id", ""),
@@ -242,11 +320,22 @@ async def search_harvard(client: httpx.AsyncClient, query: str, limit: int = 20)
     if not API_KEYS["harvard"]:
         return []
     try:
-        params = {"apikey": API_KEYS["harvard"], "q": query, "size": limit, "hasimage": 1}
-        response = await client.get("https://api.harvardartmuseums.org/object", params=params, timeout=10.0)
+        params = {
+            "apikey": API_KEYS["harvard"],
+            "q": query,
+            "size": limit,
+            "hasimage": 1
+        }
+        response = await client.get(
+            "https://api.harvardartmuseums.org/object",
+            params=params,
+            timeout=10.0
+        )
         response.raise_for_status()
+        data = response.json()
+        
         results = []
-        for item in response.json().get("records", []):
+        for item in data.get("records", []):
             if item.get("primaryimageurl"):
                 results.append({
                     "id": f"harvard_{item.get('id', '')}",
@@ -263,47 +352,82 @@ async def search_harvard(client: httpx.AsyncClient, query: str, limit: int = 20)
         return []
 
 # =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+@app.get("/")
+async def root():
+    enabled = []
+    if API_KEYS["europeana"]: enabled.append("europeana")
+    enabled.extend(["met", "victoria_albert"])  # Always enabled
+    if API_KEYS["rijksmuseum"]: enabled.append("rijksmuseum")
+    if API_KEYS["smithsonian"]: enabled.append("smithsonian")
+    if API_KEYS["harvard"]: enabled.append("harvard")
+    
+    return {
+        "name": "ArchaeoFinder API",
+        "version": "3.1.0",
+        "status": "online",
+        "features": ["multi_museum_search", "visual_search_fibel", "visual_search_coin", "visual_search_artifact", "user_auth", "save_finds"],
+        "enabled_apis": enabled,
+        "total_sources": len(enabled)
+    }
+
+@app.get("/api/search")
+async def search(
+    q: str = Query(..., description="Search query"),
+    limit: int = Query(20, ge=1, le=50),
+):
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            search_europeana(client, q, limit),
+            search_met(client, q, limit),
+            search_va(client, q, limit),
+            search_rijksmuseum(client, q, limit),
+            search_smithsonian(client, q, limit),
+            search_harvard(client, q, limit),
+        ]
+        
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    combined = []
+    for results in all_results:
+        if isinstance(results, list):
+            combined.extend(results)
+    
+    combined = [r for r in combined if r.get("image_url")]
+    
+    return {
+        "query": q,
+        "total_results": len(combined),
+        "results": combined
+    }
+
+# =============================================================================
 # FIBEL-FINDER — Visuelle Suche (768d vom Browser)
 # =============================================================================
 
 @app.post("/api/fibel/search")
 async def fibel_search(request: FibelSearchRequest):
-    """
-    Empfaengt CLIP ViT-L/14 Embedding (768d) vom Browser,
-    sucht in Supabase via pgvector Cosine Similarity.
-    """
     if len(request.embedding) != 768:
         raise HTTPException(status_code=400, detail=f"Embedding muss 768d haben, nicht {len(request.embedding)}")
-
     embedding_str = "[" + ",".join(str(x) for x in request.embedding) + "]"
-
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{SUPABASE_URL}/rest/v1/rpc/search_fibulae",
-            json={
-                "query_embedding": embedding_str,
-                "match_threshold": request.match_threshold,
-                "match_count": request.match_count,
-            },
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
+            json={"query_embedding": embedding_str, "match_threshold": request.match_threshold, "match_count": request.match_count},
+            headers={"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
             timeout=15.0,
         )
         if response.status_code != 200:
-            print(f"Supabase RPC error: {response.status_code} {response.text}")
+            print(f"Supabase RPC error (fibulae): {response.status_code} {response.text}")
             raise HTTPException(status_code=502, detail=f"Supabase Fehler: {response.status_code}")
         results = response.json()
-
     if request.source_filter:
         results = [r for r in results if r.get("source") == request.source_filter]
-
     for r in results:
         if "similarity" in r:
             r["similarity_pct"] = round(r["similarity"] * 100, 1)
-
     return {"total_results": len(results), "results": results}
 
 
@@ -334,42 +458,25 @@ async def fibel_random(count: int = Query(12, ge=1, le=50)):
 
 @app.post("/api/coin/search")
 async def coin_search(request: CoinSearchRequest):
-    """
-    Empfaengt CLIP ViT-L/14 Embedding (768d) vom Browser,
-    sucht in Supabase via pgvector Cosine Similarity.
-    """
     if len(request.embedding) != 768:
         raise HTTPException(status_code=400, detail=f"Embedding muss 768d haben, nicht {len(request.embedding)}")
-
     embedding_str = "[" + ",".join(str(x) for x in request.embedding) + "]"
-
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{SUPABASE_URL}/rest/v1/rpc/search_coins",
-            json={
-                "query_embedding": embedding_str,
-                "match_threshold": request.match_threshold,
-                "match_count": request.match_count,
-            },
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            },
+            json={"query_embedding": embedding_str, "match_threshold": request.match_threshold, "match_count": request.match_count},
+            headers={"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
             timeout=15.0,
         )
         if response.status_code != 200:
             print(f"Supabase RPC error (coins): {response.status_code} {response.text}")
             raise HTTPException(status_code=502, detail=f"Supabase Fehler: {response.status_code}")
         results = response.json()
-
     if request.source_filter:
         results = [r for r in results if r.get("source") == request.source_filter]
-
     for r in results:
         if "similarity" in r:
             r["similarity_pct"] = round(r["similarity"] * 100, 1)
-
     return {"total_results": len(results), "results": results}
 
 
@@ -395,102 +502,191 @@ async def coin_random(count: int = Query(12, ge=1, le=50)):
 
 
 # =============================================================================
-# GENERAL ENDPOINTS
+# ARTEFAKT-FINDER — Visuelle Suche (768d vom Browser)
 # =============================================================================
 
-@app.get("/")
-async def root():
-    enabled = []
-    if API_KEYS["europeana"]: enabled.append("europeana")
-    enabled.extend(["met", "victoria_albert"])
-    if API_KEYS["rijksmuseum"]: enabled.append("rijksmuseum")
-    if API_KEYS["smithsonian"]: enabled.append("smithsonian")
-    if API_KEYS["harvard"]: enabled.append("harvard")
-    return {
-        "name": "ArchaeoFinder API", "version": "5.0.0", "status": "online",
-        "features": ["multi_museum_search", "user_auth", "save_finds", "fibel_visual_search", "coin_visual_search"],
-        "enabled_apis": enabled, "total_sources": len(enabled),
-    }
-
-@app.get("/api/search")
-async def search(q: str = Query(...), limit: int = Query(20, ge=1, le=50)):
+@app.post("/api/artifact/search")
+async def artifact_search(request: ArtifactSearchRequest):
+    if len(request.embedding) != 768:
+        raise HTTPException(status_code=400, detail=f"Embedding muss 768d haben, nicht {len(request.embedding)}")
+    embedding_str = "[" + ",".join(str(x) for x in request.embedding) + "]"
     async with httpx.AsyncClient() as client:
-        tasks = [
-            search_europeana(client, q, limit), search_met(client, q, limit),
-            search_va(client, q, limit), search_rijksmuseum(client, q, limit),
-            search_smithsonian(client, q, limit), search_harvard(client, q, limit),
-        ]
-        all_results = await asyncio.gather(*tasks, return_exceptions=True)
-    combined = []
-    for r in all_results:
-        if isinstance(r, list): combined.extend(r)
-    combined = [r for r in combined if r.get("image_url")]
-    return {"query": q, "total_results": len(combined), "results": combined}
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/search_artifacts",
+            json={"query_embedding": embedding_str, "match_threshold": request.match_threshold, "match_count": request.match_count},
+            headers={"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Authorization": f"Bearer {SUPABASE_ANON_KEY}"},
+            timeout=15.0,
+        )
+        if response.status_code != 200:
+            print(f"Supabase RPC error (artifacts): {response.status_code} {response.text}")
+            raise HTTPException(status_code=502, detail=f"Supabase Fehler: {response.status_code}")
+        results = response.json()
+    if request.source_filter:
+        results = [r for r in results if r.get("source") == request.source_filter]
+    for r in results:
+        if "similarity" in r:
+            r["similarity_pct"] = round(r["similarity"] * 100, 1)
+    return {"total_results": len(results), "results": results}
+
+
+@app.get("/api/artifact/stats")
+async def artifact_stats():
+    async with httpx.AsyncClient() as client:
+        r1 = await client.get(f"{SUPABASE_URL}/rest/v1/artifact_stats", params={"select": "*"},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}, timeout=10.0)
+        r2 = await client.get(f"{SUPABASE_URL}/rest/v1/artifact_source_stats", params={"select": "*"},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}, timeout=10.0)
+        total = r1.json()[0] if r1.status_code == 200 and r1.json() else {}
+        sources = r2.json() if r2.status_code == 200 else []
+    return {"total": total, "sources": sources}
+
+
+@app.get("/api/artifact/random")
+async def artifact_random(count: int = Query(12, ge=1, le=50)):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{SUPABASE_URL}/rest/v1/artifact_embeddings",
+            params={"select": "id,source,source_id,title,image_url,thumbnail_url,source_url,museum,epoch,material,artifact_type,region", "limit": count, "order": "created_at.desc"},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}, timeout=10.0)
+        return {"results": r.json() if r.status_code == 200 else []}
+
 
 # =============================================================================
-# USER FINDS (unveraendert)
+# USER FINDS ENDPOINTS
 # =============================================================================
 
 @app.get("/api/finds")
 async def get_user_finds(authorization: Optional[str] = Header(None)):
     user = await get_user_from_token(authorization)
-    if not user: raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     async with httpx.AsyncClient() as client:
-        r = await client.get(f"{SUPABASE_URL}/rest/v1/finds",
-            params={"user_id": f"eq.{user['id']}", "order": "created_at.desc"},
-            headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY}, timeout=10.0)
-        if r.status_code == 200: return {"finds": r.json()}
-        raise HTTPException(status_code=r.status_code, detail="Failed to fetch finds")
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/finds",
+            params={
+                "user_id": f"eq.{user['id']}",
+                "order": "created_at.desc"
+            },
+            headers={
+                "Authorization": f"Bearer {authorization.replace('Bearer ', '')}",
+                "apikey": SUPABASE_ANON_KEY
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code == 200:
+            return {"finds": response.json()}
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch finds")
 
 @app.post("/api/finds")
 async def create_find(find: FindCreate, authorization: Optional[str] = Header(None)):
     user = await get_user_from_token(authorization)
-    if not user: raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     find_data = find.dict()
     find_data["user_id"] = user["id"]
     find_data["created_at"] = datetime.utcnow().isoformat()
     find_data["updated_at"] = datetime.utcnow().isoformat()
-    if find_data.get("ai_labels"): find_data["ai_labels"] = json.dumps(find_data["ai_labels"])
-    if find_data.get("matched_artifacts"): find_data["matched_artifacts"] = json.dumps(find_data["matched_artifacts"])
-    if find_data.get("find_coordinates"): find_data["find_coordinates"] = json.dumps(find_data["find_coordinates"])
+    
+    # Convert lists to JSON strings for Supabase
+    if find_data.get("ai_labels"):
+        find_data["ai_labels"] = json.dumps(find_data["ai_labels"])
+    if find_data.get("matched_artifacts"):
+        find_data["matched_artifacts"] = json.dumps(find_data["matched_artifacts"])
+    if find_data.get("find_coordinates"):
+        find_data["find_coordinates"] = json.dumps(find_data["find_coordinates"])
+    
     async with httpx.AsyncClient() as client:
-        r = await client.post(f"{SUPABASE_URL}/rest/v1/finds", json=find_data,
-            headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Prefer": "return=representation"}, timeout=10.0)
-        if r.status_code == 201: return {"success": True, "find": r.json()[0] if r.json() else None}
-        raise HTTPException(status_code=r.status_code, detail=f"Create failed: {r.text}")
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/finds",
+            json=find_data,
+            headers={
+                "Authorization": f"Bearer {authorization.replace('Bearer ', '')}",
+                "apikey": SUPABASE_ANON_KEY,
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code == 201:
+            return {"success": True, "find": response.json()[0] if response.json() else None}
+        else:
+            raise HTTPException(status_code=response.status_code, detail=f"Failed to create find: {response.text}")
 
 @app.put("/api/finds/{find_id}")
 async def update_find(find_id: str, find: FindUpdate, authorization: Optional[str] = Header(None)):
     user = await get_user_from_token(authorization)
-    if not user: raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     update_data = {k: v for k, v in find.dict().items() if v is not None}
     update_data["updated_at"] = datetime.utcnow().isoformat()
-    if update_data.get("ai_labels"): update_data["ai_labels"] = json.dumps(update_data["ai_labels"])
-    if update_data.get("matched_artifacts"): update_data["matched_artifacts"] = json.dumps(update_data["matched_artifacts"])
-    if update_data.get("find_coordinates"): update_data["find_coordinates"] = json.dumps(update_data["find_coordinates"])
+    
+    if update_data.get("ai_labels"):
+        update_data["ai_labels"] = json.dumps(update_data["ai_labels"])
+    if update_data.get("matched_artifacts"):
+        update_data["matched_artifacts"] = json.dumps(update_data["matched_artifacts"])
+    if update_data.get("find_coordinates"):
+        update_data["find_coordinates"] = json.dumps(update_data["find_coordinates"])
+    
     async with httpx.AsyncClient() as client:
-        r = await client.patch(f"{SUPABASE_URL}/rest/v1/finds",
-            params={"id": f"eq.{find_id}", "user_id": f"eq.{user['id']}"}, json=update_data,
-            headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json", "Prefer": "return=representation"}, timeout=10.0)
-        if r.status_code == 200: return {"success": True, "find": r.json()[0] if r.json() else None}
-        raise HTTPException(status_code=r.status_code, detail="Update failed")
+        response = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/finds",
+            params={
+                "id": f"eq.{find_id}",
+                "user_id": f"eq.{user['id']}"
+            },
+            json=update_data,
+            headers={
+                "Authorization": f"Bearer {authorization.replace('Bearer ', '')}",
+                "apikey": SUPABASE_ANON_KEY,
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code == 200:
+            return {"success": True, "find": response.json()[0] if response.json() else None}
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to update find")
 
 @app.delete("/api/finds/{find_id}")
 async def delete_find(find_id: str, authorization: Optional[str] = Header(None)):
     user = await get_user_from_token(authorization)
-    if not user: raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     async with httpx.AsyncClient() as client:
-        r = await client.delete(f"{SUPABASE_URL}/rest/v1/finds",
-            params={"id": f"eq.{find_id}", "user_id": f"eq.{user['id']}"},
-            headers={"Authorization": f"Bearer {authorization.replace('Bearer ', '')}", "apikey": SUPABASE_ANON_KEY}, timeout=10.0)
-        if r.status_code == 204: return {"success": True}
-        raise HTTPException(status_code=r.status_code, detail="Delete failed")
+        response = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/finds",
+            params={
+                "id": f"eq.{find_id}",
+                "user_id": f"eq.{user['id']}"
+            },
+            headers={
+                "Authorization": f"Bearer {authorization.replace('Bearer ', '')}",
+                "apikey": SUPABASE_ANON_KEY
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code == 204:
+            return {"success": True}
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to delete find")
 
 @app.get("/api/profile")
 async def get_profile(authorization: Optional[str] = Header(None)):
     user = await get_user_from_token(authorization)
-    if not user: raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     return {"user": user}
+
 
 if __name__ == "__main__":
     import uvicorn
