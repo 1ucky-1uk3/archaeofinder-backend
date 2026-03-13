@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 import json
 
-app = FastAPI(title="ArchaeoFinder API", version="3.1.0")
+app = FastAPI(title="ArchaeoFinder API", version="3.0.2")
 
 app.add_middleware(
     CORSMiddleware,
