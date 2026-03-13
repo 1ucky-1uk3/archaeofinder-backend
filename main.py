@@ -688,6 +688,157 @@ async def get_profile(authorization: Optional[str] = Header(None)):
     return {"user": user}
 
 
+# =============================================================================
+# VISUAL SEARCH - Google Lens für Archäologie
+# =============================================================================
+
+class VisualSearchRequest(BaseModel):
+    """Request für visuelle Ähnlichkeitssuche"""
+    embedding: List[float]  # 768-dim CLIP ViT-L/14-336 Vektor
+    match_threshold: float = 0.5  # Mindest-Ähnlichkeit (0-1)
+    match_count: int = 10  # Anzahl Ergebnisse
+    object_type: Optional[str] = "fibula"  # "fibula", "coin", "artifact"
+    # Optionale Filter
+    period: Optional[str] = None
+    region: Optional[str] = None
+    material: Optional[str] = None
+
+class VisualSearchResult(BaseModel):
+    """Einzelnes Suchergebnis"""
+    id: str
+    similarity: float  # 0-1 Score
+    image_url: str
+    title: str
+    source: str
+    period: Optional[str] = None
+    region: Optional[str] = None
+    material: Optional[str] = None
+    metadata: dict = {}
+
+class VisualSearchResponse(BaseModel):
+    """Response der visuellen Suche"""
+    results: List[VisualSearchResult]
+    total: int
+    query_time_ms: float
+    object_type: str
+
+@app.post("/api/visual-search", response_model=VisualSearchResponse)
+async def visual_search(request: VisualSearchRequest):
+    """
+    🎯 Google Lens für Archäologie
+    
+    Nimmt einen 768-dimensionalen CLIP-Embedding-Vektor entgegen
+    und findet visuell ähnliche Artefakte in der Datenbank.
+    
+    **Wichtig:** Das Embedding muss client-seitig (z.B. mit Transformers.js)
+    generiert werden. Der Server führt nur die pgvector-Suche durch.
+    
+    Beispiel-Request:
+    ```json
+    {
+        "embedding": [0.23, -0.15, 0.88, ...],  // 768 Zahlen
+        "match_threshold": 0.5,
+        "match_count": 10,
+        "object_type": "fibula"
+    }
+    ```
+    """
+    import time
+    start_time = time.time()
+    
+    # Validiere Embedding-Dimension
+    if len(request.embedding) != 768:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Embedding muss 768 Dimensionen haben, nicht {len(request.embedding)}"
+        )
+    
+    # Wähle passenden RPC basierend auf object_type
+    rpc_function = {
+        "fibula": "match_fibulae",
+        "fibulae": "match_fibulae",
+        "coin": "match_coins",
+        "coins": "match_coins",
+        "artifact": "match_artifacts",
+        "artifacts": "match_artifacts"
+    }.get(request.object_type.lower(), "match_fibulae")
+    
+    # Supabase RPC Parameter (match_fibulae Funktion)
+    rpc_params = {
+        "query_embedding": request.embedding,
+        "match_threshold": request.match_threshold,
+        "match_count": request.match_count
+    }
+    
+    # Zusätzliche Filter (match_fibulae verwendet filter_epoch, filter_type, filter_material)
+    if request.period:
+        rpc_params["filter_epoch"] = request.period  # "roman", "medieval", etc.
+    if request.object_type and request.object_type != "fibula":
+        rpc_params["filter_type"] = request.object_type  # Fibel-Typ
+    if request.material:
+        rpc_params["filter_material"] = request.material  # "silver", "bronze", etc.
+    # Hinweis: region Filter nicht direkt unterstützt, wird client-seitig gefiltert
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/{rpc_function}",
+                json=rpc_params,
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                    "Content-Type": "application/json"
+                },
+                timeout=5.0  # Suche sollte schnell sein (<100ms)
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Supabase RPC Fehler: {response.text}"
+                )
+            
+            # Parse Ergebnisse
+            raw_results = response.json()
+            
+            results = []
+            for item in raw_results:
+                results.append(VisualSearchResult(
+                    id=str(item.get("id", "")),
+                    similarity=float(item.get("similarity", 0)),
+                    image_url=item.get("image_url", ""),
+                    title=item.get("title", "Unbekannt"),
+                    source=item.get("source", "Unbekannt"),
+                    period=item.get("period"),
+                    region=item.get("region"),
+                    material=item.get("material"),
+                    metadata={
+                        k: v for k, v in item.items() 
+                        if k not in ["id", "similarity", "image_url", "title", "source", "period", "region", "material"]
+                    }
+                ))
+            
+            query_time = (time.time() - start_time) * 1000
+            
+            return VisualSearchResponse(
+                results=results,
+                total=len(results),
+                query_time_ms=round(query_time, 2),
+                object_type=request.object_type
+            )
+            
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Supabase RPC Timeout - Datenbank antwortet nicht"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Visual Search Fehler: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
